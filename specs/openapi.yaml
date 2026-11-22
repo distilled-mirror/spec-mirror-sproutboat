@@ -1,0 +1,1705 @@
+openapi: 3.1.0
+info:
+  title: Sproutboat Cloud API
+  version: "1.0.0-draft.1"
+  summary: "The team-key API of Sproutboat Cloud, as the CLI uses it to deploy."
+  description: |
+    Everything an integration needs to deploy and run an app on Sproutboat Cloud without the CLI: create and delete
+    apps, upload a source bundle and static assets by sha256, start and follow a build, wait until a generation is
+    live, set secrets, edit routes and custom domains, read build logs and app metrics.
+
+    This is a **draft**. It describes what the code does today, and it is checked against the Cloud's routes whenever a
+    route is added or removed. Statements
+    marked **Uncertain** were read from the code but not exercised against a live Cloud.
+
+    ## Authentication
+
+    Every route except `GET /v1/health` takes a team API key, `sbk_...`, in either header:
+
+    ```
+    Authorization: Bearer sbk_...
+    x-api-key: sbk_...
+    ```
+
+    A key belongs to one team (organization) and every call acts on that team's apps; there is no team header to set.
+    Create a key in the dashboard, **Settings, API keys**: pick a preset (Read only, Read data, Deploy, Deploy and
+    data, Admin) and an expiry (1 day to 1 year, or none). The key is shown once. A key holds *grants*, listed on each
+    operation as `x-sproutboat-permission`, for example `app:write`. `GET /v1/whoami` returns the grants of the key
+    you present. A key cannot create keys, and no route returns a secret value.
+
+    | Grant | Allows |
+    | --- | --- |
+    | `app:read` | list and read apps, builds, metrics, events |
+    | `app:write` | deploy: upload sources and assets, start builds, replace an app's spec, edit routes |
+    | `app:delete_own` | delete the apps this key created |
+    | `app:delete` | delete any app of the team |
+    | `secret:list` | read secret *names* |
+    | `secret:write` | set and delete secrets |
+    | `data:read` / `data:write` | read / change an app's D1 and R2 data |
+    | `domain:read` / `domain:write` | read / add, verify and remove custom domains |
+
+    ## Servers
+
+    The CLI's default is `https://dash.sproutboat.com` (the API and the dashboard share one origin; the API lives under
+    `/v1`). Cloud apps are served on `https://<project>.<team>.sproutboat.app`, where `<team>` is
+    `organization_slug` from `GET /v1/whoami`.
+
+    ## Errors
+
+    An error is a JSON object with a human-readable `error` string and, for most of them, a machine-readable
+    `reason`. Some add `path` (the field at fault), `need` (the missing grant) or `retry_after_s`. Branch on the
+    HTTP status and `reason`, never on the wording of `error`.
+
+    ```json
+    { "error": "hosts[0]: \"x.example.com\" is not a valid route (...)", "reason": "invalid", "path": "hosts[0]" }
+    ```
+
+    Not every error has a `reason`: a missing app or build is `{"error": "no such app"}` (404), a wrong method is
+    405 `{"error": "method not allowed"}`, an unknown path is 404 `{"error": "not found"}`, and an unexpected failure
+    is 500 `{"error": "internal error"}`. Statuses: 400 invalid input, 401 missing, invalid, expired or revoked key,
+    403 the key lacks a grant (`reason: forbidden`, `need`) or may not do this (`host-not-yours`), 404 not found
+    (another team's app is also 404), 409 conflict, 413 too large, 429 limited, 503 temporarily unavailable.
+
+    Free alpha quotas apply per team: apps per team, memory per app (`limits.memory_mb`), builds that compile per
+    rolling 24 hours, and storage (`limits.storage_mb` and the team's static assets). `GET /v1/limits` returns the
+    team's limits and usage. Over a limit: 403 with `reason` `quota-apps`, `quota-memory` or `quota-storage` when an app
+    is written, 429 with `reason: quota-builds`, `retry_after_s` and a `Retry-After` header when a build is started.
+    The `error` text is meant to be shown as it is. Treat any 403 or 429 with an unknown `reason` the same way.
+
+    ## Rate limits
+
+    - **Per key:** 600 requests a minute. Over it: 429, `reason: key-rate-limited`, `retry_after_s`, and a
+      `Retry-After` header.
+    - **Data routes** (D1 query, R2 objects): per team, 2 requests in flight and a bucket of 60 refilled at 10 a second.
+      Over it: 429, `reason: rate`, `Retry-After` header. Counted per API process, so treat them as approximate.
+    - **Builds:** per team, 3 builds queued or running, 20 new (not cached) builds an hour; platform-wide, a queue of
+      50. See `POST /v1/apps/{project}/builds` for the reasons.
+    - **Domains:** 10 custom domains per team, one verification check per domain every 10 seconds, 20 new
+      verifications an hour platform-wide.
+
+    ## Idempotency, concurrency, pagination
+
+    There is no `Idempotency-Key` header. What is safe to repeat:
+
+    - Uploads by sha256 (`PUT /v1/sources/...`, `PUT /v1/assets/blobs/...`, `PUT /v1/assets/manifests/...`) are
+      content-addressed: sending the same bytes again is a no-op (`stored: false`).
+    - `POST /v1/apps/{project}/builds` with the same source, `build` and runtime answers from a cache (HTTP 200, a
+      `ready` build with `cached: true`) instead of building again; the app still gets a new `record_generation`.
+    - `POST /v1/domains` for a host you already claimed returns the existing claim (200).
+    - Every write to an app (`PUT`, secrets, routes, a finished build) bumps its `record_generation`, even when the
+      content did not change. Writes to one app are serialized; the last write wins. A newer build of a project
+      cancels its older *queued* build (`superseded: true`).
+
+    No list route has a cursor. `GET /v1/apps` returns every app. `GET /v1/apps/{project}/builds` takes `limit`
+    (1 to 100, default 20) and returns the newest. Metrics and events are windows (a range, the last 20 events per kind).
+
+    ## What is not in this file
+
+    Git push-to-deploy (`/v1/git/*`, `/v1/apps/{project}/git*`), the browser sign-in flows, and team and key management
+    are not part of this file. There is **no route for a running app's stdout logs**:
+    build logs stream over `GET /v1/builds/{id}/events`, and `GET /v1/apps/{project}/events` returns only the last
+    exceptions and triggers. There is no rollback route either; see *Deploy flow* for how a previous version is redeployed.
+
+    ## Deploy flow
+
+    This is the order the CLI calls the routes for `sproutboat deploy` (source build, the default):
+
+    1. `GET /v1/whoami` for the team slug, once, to name the route `<project>.<slug>.sproutboat.app`.
+    2. `GET /v1/apps` (only when the app binds other apps as services) and `GET /v1/apps/{project}` (404 means a new app).
+    3. If the app has static assets: `POST /v1/assets/missing`, `PUT /v1/assets/blobs/{sha256}` for each missing one,
+       `PUT /v1/assets/manifests/{sha256}`. The manifest's digest is its `assets_manifest_ref` (`assets/<sha256>`).
+    4. `POST /v1/sources/missing`, then `PUT /v1/sources/{sha256}` if the source is missing. The source is the app's
+       **generated JavaScript**, a single UTF-8 file of at most 8 MiB that the CLI produces (`sproutboat build
+       --standalone --emit-only` prints its path). The API has no way to build from your own TypeScript.
+    5. `POST /v1/apps/{project}/builds` with `{source_sha256, kind: "generated", build, spec}`. The `spec` carries the
+       routes (`hosts_patch`), `assets_manifest_ref`, `bindings`, `crons`, `queue_consumers` and `services`.
+       **This is how a team creates or updates an app**; there is no separate create call. Secrets are not allowed in
+       a build's `spec` (it is stored in plain text).
+    6. Follow `GET /v1/builds/{id}/events` (Server-Sent Events) until `done`, or poll `GET /v1/builds/{id}` until
+       `state` is `ready`, `failed` or `canceled`. `record_generation` appears on the build when it is `ready`.
+    7. If there are secrets: `PATCH /v1/apps/{project}/secrets`; it returns a newer `record_generation`.
+    8. **Is it live?** Poll `GET /v1/apps/{project}` until `apply.state` is `applied` and `apply.applied_generation` is at
+       least the `record_generation` you are waiting for. The CLI treats `failed` and `fenced` as terminal (`apply.error` says
+       why) and otherwise waits up to 120 s, polling every 2 s. `apply` is null until the first apply was attempted.
+
+    **Redeploying an earlier version.** A finished build names its `module_sha256`. `PUT /v1/apps/{project}` accepts a
+    module your own team's builds produced, so a spec with `module.sha256` set to an earlier build's value moves the app
+    back to it (**Uncertain**: this follows from the rule on `PUT /v1/apps/{project}`, and was not exercised against a live Cloud). Building the same
+    source again is a cache hit and takes no build time.
+  contact:
+    name: Sproutboat
+    url: https://sproutboat.com
+servers:
+  - url: https://dash.sproutboat.com
+    description: "Sproutboat Cloud (the CLI's default API address)"
+security:
+  - bearerKey: []
+  - apiKeyHeader: []
+tags:
+  - name: Meta
+    description: "Health, the identity of a key, and the team's limits."
+  - name: Apps
+    description: "Create, read, replace and delete apps."
+  - name: Uploads
+    description: "Source bundles and static assets, uploaded by sha256."
+  - name: Builds
+    description: "Start a build, follow its log, cancel it."
+  - name: Secrets
+    description: "Per-app secrets. Names can be listed, values never come back."
+  - name: Routes and domains
+    description: "Routes of an app, and custom domains a team proves it owns."
+  - name: Data
+    description: "SQL on an app's D1 databases and objects in its R2 buckets."
+  - name: Observability
+    description: "Metrics, recent events and notices."
+paths:
+  /v1/health:
+    get:
+      operationId: getHealth
+      tags: [Meta]
+      summary: "Liveness"
+      description: "No credentials needed."
+      security: []
+      responses:
+        "200":
+          description: "The API answers."
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok]
+                properties:
+                  ok: { type: boolean, const: true }
+  /v1/whoami:
+    get:
+      operationId: getWhoami
+      tags: [Meta]
+      summary: "Who a key is"
+      description: |
+        The team, the key and its grants. A provider calls this once to learn the team slug (for the default route
+        `<project>.<slug>.sproutboat.app`) and to check that the key can do what it needs.
+      responses:
+        "200":
+          description: "The key's identity."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Whoami" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/KeyRateLimited" }
+  /v1/keys/self:
+    delete:
+      operationId: revokeSelf
+      tags: [Meta]
+      summary: "Revoke this key"
+      description: "Deletes the API key used for this request, whatever its grants. There is no undo."
+      responses:
+        "200":
+          description: "The key is gone."
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [revoked]
+                properties:
+                  revoked: { type: boolean, const: true }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /v1/apps:
+    get:
+      operationId: listApps
+      tags: [Apps]
+      summary: "List the team's apps"
+      description: "Every live app of the team, most recently updated first. Not paginated. `secrets` is null unless the key holds `secret:list`."
+      x-sproutboat-permission: "app:read"
+      responses:
+        "200":
+          description: "The apps."
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [apps]
+                properties:
+                  apps:
+                    type: array
+                    items: { $ref: "#/components/schemas/AppSummary" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/KeyRateLimited" }
+  /v1/apps/{project}:
+    parameters:
+      - $ref: "#/components/parameters/project"
+    get:
+      operationId: getApp
+      tags: [Apps]
+      summary: "Read an app"
+      description: |
+        The app's stored spec (secrets as sorted names, or null without `secret:list`), its routes with certificate
+        state, runtime state, the build that is live and the one before it, and `apply`, which says whether a host has
+        applied a `record_generation`. This is the "is it live" call: see *Deploy flow*, step 8.
+      x-sproutboat-permission: "app:read"
+      responses:
+        "200":
+          description: "The app."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/App" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/KeyRateLimited" }
+    put:
+      operationId: putApp
+      tags: [Apps]
+      summary: "Replace an app's spec"
+      description: |
+        Writes the whole spec of an app and bumps its `record_generation`. A team key cannot place a module directly:
+        `module.sha256` must be the module the app already runs, or one your own team's builds produced; anything else
+        is 403 `module-upload-disabled`. So this route changes **configuration** (bindings, crons, limits, routes,
+        assets) of an existing app, or moves it to an earlier module of yours. To create an app or ship new code, use
+        `POST /v1/apps/{project}/builds`.
+
+        **PUT replaces.** Omitted `hosts`, `bindings`, `services`, `crons`, `queue_consumers` and `limits` become empty
+        and `active` becomes true. Send everything you want to keep, or use `hosts_patch` and `secrets_patch` to leave
+        routes and secrets alone. Omitting `secrets` keeps the stored secrets; `secrets: null` clears them; an object
+        replaces the whole set. Setting any secret needs `secret:write` in addition to `app:write`.
+
+        Unknown keys are refused by name (400, `reason: invalid`, `path`). Route keys: a team may add only
+        `<name>.<team slug>.sproutboat.app` (any path under it) or a hostname it has verified as a custom domain;
+        another route is 403 `host-not-yours`. A route another app holds is 409 `route-taken`.
+      x-sproutboat-permission: "app:write"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/AppSpecInput" }
+      responses:
+        "200":
+          description: "The spec was stored. Wait for `apply` as in *Deploy flow*, step 8."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/GenerationWritten" }
+        "400": { $ref: "#/components/responses/Invalid" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "429": { $ref: "#/components/responses/Limited" }
+    delete:
+      operationId: deleteApp
+      tags: [Apps]
+      summary: "Delete an app"
+      description: |
+        Marks the app deleted; the Cloud then removes it from its host, so it stops serving shortly after. A key with `app:delete` may
+        delete any app of the team; a key with only `app:delete_own` may delete the apps that very key created (an app
+        made by another key, or before creator tracking, is 403 `forbidden`, `need: app:delete`).
+        Deleting an app that is already gone is 404. Not undoable.
+      x-sproutboat-permission: "app:delete_own"
+      responses:
+        "200":
+          description: "Deleted."
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [deleted]
+                properties:
+                  deleted: { type: boolean, const: true }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/KeyRateLimited" }
+  /v1/sources/missing:
+    post:
+      operationId: sourcesMissing
+      tags: [Uploads]
+      summary: "Missing sources"
+      x-sproutboat-permission: "app:write"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [sha256]
+              properties:
+                sha256:
+                  type: array
+                  maxItems: 100
+                  items: { $ref: "#/components/schemas/Sha256" }
+      responses:
+        "200":
+          description: "The digests to upload."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MissingList" }
+        "400": { $ref: "#/components/responses/Invalid" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+  /v1/sources/{sha256}:
+    parameters:
+      - $ref: "#/components/parameters/sha256"
+    put:
+      operationId: putSource
+      tags: [Uploads]
+      summary: "Upload a source bundle"
+      description: |
+        The bytes of the app's generated JavaScript, as `application/octet-stream`. At most 8 MiB, non-empty, valid
+        UTF-8, and `sha256` must be the lowercase hex SHA-256 of exactly these bytes (else 400 `digest mismatch`).
+        Idempotent. Not tied to an app until a build names it.
+      x-sproutboat-permission: "app:write"
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema: { type: string, format: binary }
+      responses:
+        "200":
+          description: "Stored."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Stored" }
+        "400": { $ref: "#/components/responses/Invalid" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "413": { $ref: "#/components/responses/TooLarge" }
+  /v1/assets/missing:
+    post:
+      operationId: assetsMissing
+      tags: [Uploads]
+      summary: "Missing asset blobs"
+      description: "Send the sha256 of every file (and precompressed variant) in the manifest; upload the ones returned."
+      x-sproutboat-permission: "app:write"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [sha256]
+              properties:
+                sha256:
+                  type: array
+                  maxItems: 60000
+                  items: { $ref: "#/components/schemas/Sha256" }
+      responses:
+        "200":
+          description: "The digests to upload."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MissingList" }
+        "400": { $ref: "#/components/responses/Invalid" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+  /v1/assets/blobs/{sha256}:
+    parameters:
+      - $ref: "#/components/parameters/sha256"
+    put:
+      operationId: putAssetBlob
+      tags: [Uploads]
+      summary: "Upload one asset file"
+      description: "Raw bytes, at most 64 MiB; `sha256` must match them. Idempotent. The CLI uploads up to 4 at a time."
+      x-sproutboat-permission: "app:write"
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema: { type: string, format: binary }
+      responses:
+        "200":
+          description: "Stored."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Stored" }
+        "400": { $ref: "#/components/responses/Invalid" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "413": { $ref: "#/components/responses/TooLarge" }
+  /v1/assets/manifests/{sha256}:
+    parameters:
+      - $ref: "#/components/parameters/sha256"
+    put:
+      operationId: putAssetManifest
+      tags: [Uploads]
+      summary: "Upload an assets manifest"
+      description: |
+        The manifest JSON (see `AssetManifest`), at most 4 MiB, 20,000 files and 512 MiB in total, uploaded after every
+        blob it names. `sha256` is the digest of the manifest's exact bytes; the app then references it as
+        `assets_manifest_ref: "assets/<sha256>"`. If a blob is missing the answer is 409 `blobs-missing` with up to 100
+        digests in `missing` (and the full count in `missing_count`). Idempotent.
+      x-sproutboat-permission: "app:write"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/AssetManifest" }
+      responses:
+        "200":
+          description: "Stored."
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [sha256, ref, files, bytes, stored]
+                properties:
+                  sha256: { $ref: "#/components/schemas/Sha256" }
+                  ref: { type: string, examples: ["assets/0f3a...e1"] }
+                  files: { type: integer }
+                  bytes: { type: integer }
+                  stored: { type: boolean }
+        "400": { $ref: "#/components/responses/Invalid" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409":
+          description: "Blobs the manifest names are not uploaded (`reason: blobs-missing`)."
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Error"
+                  - type: object
+                    properties:
+                      missing: { type: array, items: { $ref: "#/components/schemas/Sha256" } }
+                      missing_count: { type: integer }
+        "413": { $ref: "#/components/responses/TooLarge" }
+    get:
+      operationId: getAssetManifest
+      tags: [Uploads]
+      summary: "Read an assets manifest"
+      x-sproutboat-permission: "app:read"
+      responses:
+        "200":
+          description: "The manifest JSON, byte for byte as uploaded."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AssetManifest" }
+        "400": { $ref: "#/components/responses/Invalid" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /v1/apps/{project}/builds:
+    parameters:
+      - $ref: "#/components/parameters/project"
+    post:
+      operationId: createBuild
+      tags: [Builds]
+      summary: "Start a build"
+      description: |
+        Validates the request, then either answers from the cache (HTTP 200, a `ready` build with `cached: true`) or
+        queues a build (HTTP 202, `state: queued`). When the build finishes the Cloud writes the app with the new
+        module and `spec`, and sets `record_generation` on the build; a host then applies it (see `GET /v1/apps/{project}`).
+        A newer build of the same project cancels an older queued one.
+
+        `spec` takes the same keys as `PUT /v1/apps/{project}` **except** `module`, `secrets` and `secrets_patch`
+        (400 `invalid`, `path: spec.<key>`): it is stored in plain text, so set secrets with `PATCH
+        /v1/apps/{project}/secrets` after the build is `ready`. Use `hosts_patch` rather than `hosts` to leave an app's
+        other routes alone. Route ownership and conflicts are checked up front, and again when the build lands.
+
+        `build` is `{"v": 1, "name": "<project>", "cli": {"version": "...", "runtime": "...", "toolchain": "..."}}`;
+        `name` must equal the project. `kind` must be `generated` (the only kind that exists). The source must already
+        be uploaded (409 `source-missing`).
+      x-sproutboat-permission: "app:write"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateBuildRequest" }
+      responses:
+        "200":
+          description: "Answered from the cache, or an identical failed build refused again (`state: failed`, `cached: true`)."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Build" }
+        "202":
+          description: "Queued."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Build" }
+        "400": { $ref: "#/components/responses/Invalid" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "413": { $ref: "#/components/responses/TooLarge" }
+        "429":
+          description: |
+            Limited. `reason` is `team-queue-full` (3 builds already queued or running for the team), `team-hourly-limit`
+            (20 builds in the last hour), `queue-full` (platform-wide queue; carries `retry_after_s`, `queue_length`,
+            `drain_s` and a `Retry-After` header) `key-rate-limited` or `quota-builds` (the free alpha builds per 24 hours; carries `retry_after_s` and a `Retry-After` header).
+          headers:
+            Retry-After: { $ref: "#/components/headers/RetryAfter" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: |
+            Builds are not available right now: `reason: builds-disabled` (this Cloud does not build) or `no-builder`
+            (none is ready; retry in a few minutes).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+    get:
+      operationId: listBuilds
+      tags: [Builds]
+      summary: "List an app's builds"
+      description: "Newest first, builds of every trigger (CLI, dashboard, git). No cursor: `limit` only. This route is recorded in the team's audit trail, so it can answer 503 `audit-unavailable`."
+      x-sproutboat-permission: "app:read"
+      parameters:
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+      responses:
+        "200":
+          description: "The builds."
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [builds]
+                properties:
+                  builds:
+                    type: array
+                    items: { $ref: "#/components/schemas/Build" }
+        "400": { $ref: "#/components/responses/Invalid" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503":
+          description: "The audit log could not record the request (`reason: audit-unavailable`); nothing was served. Retry shortly."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+  /v1/builds/{id}:
+    parameters:
+      - $ref: "#/components/parameters/buildId"
+    get:
+      operationId: getBuild
+      tags: [Builds]
+      summary: "Build status"
+      description: "Poll this (every 2 s is what the CLI does) or use the event stream. `state` is `queued`, `building`, `ready`, `failed` or `canceled`."
+      x-sproutboat-permission: "app:read"
+      responses:
+        "200":
+          description: "The build."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Build" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      operationId: cancelBuild
+      tags: [Builds]
+      summary: "Cancel a build"
+      description: |
+        A queued build becomes `canceled` at once; a running one is asked to stop and ends as `canceled` shortly. A build
+        that already finished is returned unchanged (so this is safe to call after the fact).
+      x-sproutboat-permission: "app:write"
+      responses:
+        "200":
+          description: "The build after the request."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Build" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /v1/builds/{id}/events:
+    parameters:
+      - $ref: "#/components/parameters/buildId"
+    get:
+      operationId: streamBuildEvents
+      tags: [Builds]
+      summary: "Stream a build's log"
+      description: |
+        `text/event-stream`. Frames: `state` (state or queue position changed), `log` (a chunk of build output, `id` is
+        its sequence number), `done` (once, the final build object; the stream then ends) and `error`. A `: keepalive`
+        comment arrives every few seconds. Past logs are replayed from `after`, so to reconnect after a drop pass the
+        last `id` you saw as `after` (or as `Last-Event-ID`). The stream is closed by the server after 20 minutes
+        whatever the state: reconnect, or fall back to polling `GET /v1/builds/{id}`. The log of a build is kept to
+        256 KiB and ends with `[log truncated at 256 KiB]` beyond that.
+      x-sproutboat-permission: "app:read"
+      parameters:
+        - name: after
+          in: query
+          description: "Replay only log chunks with a larger sequence number. Default 0."
+          schema: { type: integer, minimum: 0, default: 0 }
+        - name: Last-Event-ID
+          in: header
+          description: "Used when `after` is absent."
+          schema: { type: integer, minimum: 0 }
+      responses:
+        "200":
+          description: "The event stream."
+          content:
+            text/event-stream:
+              schema:
+                type: string
+                examples:
+                  - |
+                    event: state
+                    data: {"state":"queued","position":1,"waiting":null,"expected_s":60,"estimated_start_s":0,"starved":false}
+
+                    id: 1
+                    event: log
+                    data: {"text":"compiling...\n"}
+
+                    event: done
+                    data: {"id":"...","state":"ready","record_generation":7}
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /v1/apps/{project}/secrets:
+    parameters:
+      - $ref: "#/components/parameters/project"
+    get:
+      operationId: listSecrets
+      tags: [Secrets]
+      summary: "List secret names"
+      description: "Sorted names only. Values are never returned by any route."
+      x-sproutboat-permission: "secret:list"
+      responses:
+        "200":
+          description: "The names."
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [secrets]
+                properties:
+                  secrets:
+                    type: array
+                    items: { type: string }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    patch:
+      operationId: patchSecrets
+      tags: [Secrets]
+      summary: "Patch secrets"
+      description: |
+        Deletes first, then sets, in one write that bumps `record_generation`. Deleting a name that is not there is not an error here. Names match `[A-Za-z_][A-Za-z0-9_]*`, at
+        most 128 characters; at most 128 secrets per app and 64 KiB of values in total. Values are strings.
+      x-sproutboat-permission: "secret:write"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SecretsPatch" }
+      responses:
+        "200":
+          description: "Written."
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [app_id, record_generation, names]
+                properties:
+                  app_id: { type: string }
+                  record_generation: { type: integer }
+                  names: { type: array, items: { type: string } }
+        "400": { $ref: "#/components/responses/Invalid" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /v1/apps/{project}/secrets/{name}:
+    parameters:
+      - $ref: "#/components/parameters/project"
+      - name: name
+        in: path
+        required: true
+        schema: { type: string, pattern: "^[A-Za-z_][A-Za-z0-9_]{0,127}$" }
+    put:
+      operationId: putSecret
+      tags: [Secrets]
+      summary: "Set one secret"
+      description: "The app must exist (404 otherwise). Bumps `record_generation` even if the value is unchanged."
+      x-sproutboat-permission: "secret:write"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [value]
+              properties:
+                value: { type: string }
+      responses:
+        "200":
+          description: "Written."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SecretWritten" }
+        "400": { $ref: "#/components/responses/Invalid" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      operationId: deleteSecret
+      tags: [Secrets]
+      summary: "Delete one secret"
+      description: "404 `no such secret` when the app has no secret by that name (nothing is written then)."
+      x-sproutboat-permission: "secret:write"
+      responses:
+        "200":
+          description: "Deleted."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SecretWritten" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /v1/apps/{project}/routes:
+    parameters:
+      - $ref: "#/components/parameters/project"
+    patch:
+      operationId: patchRoutes
+      tags: [Routes and domains]
+      summary: "Add and remove routes"
+      description: |
+        Edits the route list and nothing else: no module, no other spec key. Removals run first, then additions are
+        appended; a route in neither list stays. A route is a hostname, or `hostname/path/prefix` (at most 8 segments,
+        no trailing slash). A team may add `<label>.<team slug>.sproutboat.app` names, or hostnames it has verified under
+        `/v1/domains`; other names are 403 `host-not-yours`. A route another app holds is 409 `route-taken`. At most 64
+        routes per app. Bumps `record_generation`.
+      x-sproutboat-permission: "app:write"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/HostsPatch" }
+      responses:
+        "200":
+          description: "The routes after the change."
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [app_id, record_generation, hosts]
+                properties:
+                  app_id: { type: string }
+                  record_generation: { type: integer }
+                  hosts: { type: array, items: { type: string } }
+        "400": { $ref: "#/components/responses/Invalid" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+  /v1/domains:
+    get:
+      operationId: listDomains
+      tags: [Routes and domains]
+      summary: "List the team's custom domains"
+      x-sproutboat-permission: "domain:read"
+      responses:
+        "200":
+          description: "The claims, by hostname."
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [domains]
+                properties:
+                  domains:
+                    type: array
+                    items: { $ref: "#/components/schemas/DomainClaim" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+    post:
+      operationId: addDomain
+      tags: [Routes and domains]
+      summary: "Claim a custom domain"
+      description: |
+        Starts the proof for one exact hostname (no wildcards; lowercase, no trailing dot). The answer carries `txt`, the
+        DNS record to publish: name `_sproutboat-challenge.<host>`, type `TXT`, the given value. Then call
+        `POST /v1/domains/{host}/verify`. Claiming a host you already claimed returns the claim (200). A team holds at most 10
+        domains (429 `domain-limit`). Names under `sproutboat.app` and the platform's own hostnames cannot be claimed.
+        Once verified, add the hostname to an app's routes (`PATCH /v1/apps/{project}/routes`); a certificate is then issued
+        on first use.
+      x-sproutboat-permission: "domain:write"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [host]
+              properties:
+                host: { type: string, examples: [app.example.com] }
+      responses:
+        "200":
+          description: "The existing claim."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DomainClaim" }
+        "201":
+          description: "A new pending claim."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DomainClaim" }
+        "400": { $ref: "#/components/responses/Invalid" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "429": { $ref: "#/components/responses/Limited" }
+  /v1/domains/{host}:
+    parameters:
+      - $ref: "#/components/parameters/host"
+    delete:
+      operationId: deleteDomain
+      tags: [Routes and domains]
+      summary: "Release a custom domain"
+      description: "Refused with 409 `domain-in-use` while an app of the team still routes the name; remove those routes first."
+      x-sproutboat-permission: "domain:write"
+      responses:
+        "200":
+          description: "Released."
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [deleted]
+                properties:
+                  deleted: { type: string, description: "The hostname." }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+  /v1/domains/{host}/verify:
+    parameters:
+      - $ref: "#/components/parameters/host"
+    post:
+      operationId: verifyDomain
+      tags: [Routes and domains]
+      summary: "Check the DNS proof"
+      description: |
+        Looks the TXT record up through two public resolvers; both must agree. 400 `reason` explains a miss (the record is
+        not there yet, or the resolvers disagree). One check per domain every 10 seconds (429 `verify-cooldown`,
+        `retry_after_s`), and 20 new verifications an hour platform-wide (429 `verify-cap`). DNS can take minutes to
+        propagate, so poll no faster than the cooldown.
+      x-sproutboat-permission: "domain:write"
+      responses:
+        "200":
+          description: "The claim, now `verified` if the proof was found."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DomainClaim" }
+        "400": { $ref: "#/components/responses/Invalid" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "429": { $ref: "#/components/responses/Limited" }
+  /v1/domains/{host}/status:
+    parameters:
+      - $ref: "#/components/parameters/host"
+    get:
+      operationId: getDomainStatus
+      tags: [Routes and domains]
+      summary: "Domain status"
+      description: |
+        `dns.points_here` says whether the name resolves to the platform (`yes`, `no`, `unknown`) and `dns.ingress` is what
+        it should point at. `certificate` is null unless the claim is verified, an app routes the name and certificate
+        probing is on. `?refresh=1` forces a fresh certificate check.
+      x-sproutboat-permission: "domain:read"
+      parameters:
+        - name: refresh
+          in: query
+          schema: { type: string, enum: ["1"] }
+      responses:
+        "200":
+          description: "The state."
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [domain, dns, certificate]
+                properties:
+                  domain: { $ref: "#/components/schemas/DomainClaim" }
+                  dns:
+                    type: object
+                    properties:
+                      points_here: { type: string, enum: ["yes", "no", "unknown"] }
+                      detail: { type: string }
+                      ingress: { type: object, additionalProperties: true, description: "What the name should point at (addresses or a name)." }
+                  certificate:
+                    type: [object, "null"]
+                    additionalProperties: true
+                    description: "`{state: pending|issuing|ready|failed, reason, expires_at}` or null. Uncertain: the exact fields."
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /v1/apps/{project}/d1/{binding}/query:
+    parameters:
+      - $ref: "#/components/parameters/project"
+      - name: binding
+        in: path
+        required: true
+        description: "The D1 binding name from the app's config, for example `DB`."
+        schema: { type: string }
+    post:
+      operationId: queryD1
+      tags: [Data]
+      summary: "Query D1"
+      description: |
+        Runs `statements` on the host that holds the app's database. With only `data:read` the database is opened
+        read-only (a write is refused); changing data needs `data:write`. Up to 100 statements, 4 MiB of SQL, 100 bound
+        parameters per statement. `transaction` defaults to true (all or nothing). A first-filter guard refuses
+        `ATTACH`, `PRAGMA` (except introspection), `load_extension` and transaction control. This route is audited
+        (no SQL text is stored) and counts against the data-route limits.
+      x-sproutboat-permission: "data:read"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [statements]
+              properties:
+                statements:
+                  type: array
+                  maxItems: 100
+                  items:
+                    type: object
+                    required: [sql]
+                    properties:
+                      sql: { type: string }
+                      params: { type: array, items: { type: [string, number, boolean, "null"] }, maxItems: 100 }
+                transaction: { type: boolean, default: true }
+      responses:
+        "200":
+          description: "One result per statement, in the shape of Cloudflare's D1 REST API."
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  results:
+                    type: array
+                    items:
+                      type: object
+                      additionalProperties: true
+                      properties:
+                        success: { type: boolean }
+                        results: { type: array, items: { type: object, additionalProperties: true } }
+                        meta: { type: object, additionalProperties: true }
+        "400": { $ref: "#/components/responses/Invalid" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "413": { $ref: "#/components/responses/TooLarge" }
+        "429": { $ref: "#/components/responses/Limited" }
+        "503":
+          description: "The app's host is not reachable, or the audit log could not record the request (`reason: audit-unavailable`). Retry shortly."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+  /v1/apps/{project}/r2/{bucket}/objects/{key}:
+    parameters:
+      - $ref: "#/components/parameters/project"
+      - name: bucket
+        in: path
+        required: true
+        description: "The R2 binding name from the app's config, for example `FILES`."
+        schema: { type: string }
+      - name: key
+        in: path
+        required: true
+        description: "The object key. May contain `/`, which must stay literal in the path. Percent-encoded dots, slashes and backslashes are refused."
+        schema: { type: string }
+        allowReserved: true
+    get:
+      operationId: getR2Object
+      tags: [Data]
+      summary: "Read an object"
+      description: |
+        The bytes, always served as an inert download (`content-type: application/octet-stream`, `content-disposition:
+        attachment`, `content-security-policy: sandbox`); the object's own HTTP metadata comes back as `x-object-*`
+        headers and `etag`.
+      x-sproutboat-permission: "data:read"
+      responses:
+        "200":
+          description: "The object."
+          content:
+            application/octet-stream:
+              schema: { type: string, format: binary }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/Limited" }
+    put:
+      operationId: putR2Object
+      tags: [Data]
+      summary: "Write an object"
+      description: "At most 64 MiB. The length must be declared with `Content-Length`, or `X-Declared-Length` for a chunked body (else 411)."
+      x-sproutboat-permission: "data:write"
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema: { type: string, format: binary }
+      responses:
+        "200":
+          description: "Stored."
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  key: { type: string }
+                  size: { type: integer }
+                  etag: { type: string }
+        "400": { $ref: "#/components/responses/Invalid" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "413": { $ref: "#/components/responses/TooLarge" }
+        "429": { $ref: "#/components/responses/Limited" }
+    delete:
+      operationId: deleteR2Object
+      tags: [Data]
+      summary: "Delete an object"
+      description: "Deleting a key that does not exist is not an error, as in R2."
+      x-sproutboat-permission: "data:write"
+      responses:
+        "200":
+          description: "Deleted."
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  key: { type: string }
+                  deleted: { type: boolean, const: true }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/Limited" }
+  /v1/apps/{project}/metrics:
+    parameters:
+      - $ref: "#/components/parameters/project"
+    get:
+      operationId: getAppMetrics
+      tags: [Observability]
+      summary: "App metrics"
+      description: |
+        Aggregates over a range: request counts by status class, outcomes, latency histograms, wakes, CPU and memory.
+        One-minute points are kept 7 days, hourly points longer (`retention` in the answer says how long).
+        **Uncertain:** the point and total fields are large and still change; this file documents the envelope only.
+      x-sproutboat-permission: "app:read"
+      parameters:
+        - name: range
+          in: query
+          schema: { type: string, enum: ["1h", "24h", "7d", "30d", "90d"], default: "1h" }
+      responses:
+        "200":
+          description: "The metrics."
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+                properties:
+                  range: { type: string }
+                  step_seconds: { type: integer }
+                  from: { type: string, format: date-time }
+                  to: { type: string, format: date-time }
+                  points: { type: array, items: { type: object, additionalProperties: true } }
+                  totals: { type: object, additionalProperties: true }
+        "400": { $ref: "#/components/responses/Invalid" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /v1/apps/{project}/events:
+    parameters:
+      - $ref: "#/components/parameters/project"
+    get:
+      operationId: getAppEvents
+      tags: [Observability]
+      summary: "Recent exceptions and triggers"
+      description: |
+        The last 20 events of a kind (40 without `kind`), newest first. This is **not** a log stream: it holds uncaught
+        exceptions and cron or queue triggers with their status and duration, kept in a small ring.
+      x-sproutboat-permission: "app:read"
+      parameters:
+        - name: kind
+          in: query
+          schema: { type: string, enum: [exception, trigger] }
+      responses:
+        "200":
+          description: "The events."
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [events]
+                properties:
+                  events:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        kind: { type: string }
+                        at: { type: string, format: date-time }
+                        status: { type: [integer, "null"] }
+                        outcome: { type: [string, "null"] }
+                        ms: { type: [integer, "null"] }
+                        message: { type: [string, "null"] }
+        "400": { $ref: "#/components/responses/Invalid" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /v1/notices:
+    get:
+      operationId: listNotices
+      tags: [Observability]
+      summary: "List notices"
+      description: "What the team has been told about its apps, for example that a build for the next runtime version fails. `project` filters to one app."
+      x-sproutboat-permission: "app:read"
+      parameters:
+        - name: project
+          in: query
+          schema: { type: string }
+      responses:
+        "200":
+          description: "Unresolved notices, newest first."
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [notices]
+                properties:
+                  notices:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: { type: integer }
+                        project: { type: string }
+                        kind: { type: string }
+                        title: { type: string }
+                        body: { type: object, additionalProperties: true }
+                        created_at: { type: string, format: date-time }
+                        updated_at: { type: string, format: date-time }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+  /v1/limits:
+    get:
+      operationId: getLimits
+      tags: [Meta]
+      summary: "Get the team's limits and usage"
+      description: "The free alpha limits that apply to the team (defaults, with any limit raised for this team) and what it uses now. `null` is unlimited. Memory is a ceiling per app, so it has no usage."
+      x-sproutboat-permission: "app:read"
+      responses:
+        "200":
+          description: "Limits and usage."
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [enabled, limits, overridden, usage]
+                properties:
+                  enabled: { type: boolean, description: "False when this Cloud enforces no quotas." }
+                  limits:
+                    type: object
+                    properties:
+                      apps: { type: [integer, "null"] }
+                      memory_mb: { type: [integer, "null"], description: "MiB per app." }
+                      builds_per_day: { type: [integer, "null"], description: "Builds that compile in a rolling 24 hours; cached builds are free." }
+                      storage_mb: { type: [integer, "null"] }
+                  overridden:
+                    type: array
+                    description: "The limits raised (or lowered) for this team."
+                    items: { type: string, enum: [apps, memory_mb, builds_per_day, storage_mb] }
+                  usage:
+                    type: object
+                    properties:
+                      apps: { type: integer }
+                      builds_24h: { type: integer }
+                      assets_mb: { type: number, description: "MiB of static assets across the team's apps." }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+components:
+  securitySchemes:
+    bearerKey:
+      type: http
+      scheme: bearer
+      description: "A team API key, `sbk_...`, from Settings, API keys."
+    apiKeyHeader:
+      type: apiKey
+      in: header
+      name: x-api-key
+      description: "The same key, in a header of its own."
+  headers:
+    RetryAfter:
+      description: "Seconds to wait before trying again."
+      schema: { type: integer }
+  parameters:
+    project:
+      name: project
+      in: path
+      required: true
+      description: "The app's name, unique within the team. 3 to 32 characters (or 1), lowercase letters, digits and dashes, not starting or ending with a dash."
+      schema: { type: string, pattern: "^[a-z0-9](?:[a-z0-9-]{1,30}[a-z0-9])?$", examples: [my-app] }
+    sha256:
+      name: sha256
+      in: path
+      required: true
+      description: "Lowercase hex SHA-256 of the exact bytes of the body."
+      schema: { $ref: "#/components/schemas/Sha256" }
+    buildId:
+      name: id
+      in: path
+      required: true
+      description: "A build id (a UUID, from `POST /v1/apps/{project}/builds`)."
+      schema: { type: string, format: uuid }
+    host:
+      name: host
+      in: path
+      required: true
+      description: "A custom domain, lowercase, percent-encoded if needed."
+      schema: { type: string, examples: [app.example.com] }
+  responses:
+    Unauthorized:
+      description: "No key, or an invalid, expired or revoked key (`unknown or missing API token`, `invalid, expired or revoked API key`)."
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    KeyRateLimited:
+      description: "The key is over 600 requests a minute (`reason: key-rate-limited`, `retry_after_s`, `Retry-After`)."
+      headers:
+        Retry-After: { $ref: "#/components/headers/RetryAfter" }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Forbidden:
+      description: |
+        The key lacks a grant (`reason: forbidden`, `need: "<resource>:<action>"`), may not use a route
+        (`host-not-yours`), or tried to place a module (the one answer without a `reason`: `{"error": "module-upload-disabled", "message": "..."}`). Quota refusals may also be 403.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    NotFound:
+      description: "No such app, build, secret or claim in this team (another team's resource looks the same)."
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Invalid:
+      description: "The request is malformed. `path` names the field."
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Conflict:
+      description: "A conflict, with `reason` such as `route-taken`, `source-missing`, `domain-in-use`, `host-claimed` or `claim-changed`."
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    TooLarge:
+      description: "The body is over the limit for this route."
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Limited:
+      description: "Rate-limited or over a per-team cap; see *Rate limits*. Honor `Retry-After` when it is present."
+      headers:
+        Retry-After: { $ref: "#/components/headers/RetryAfter" }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      additionalProperties: true
+      properties:
+        error: { type: string, description: "A message for people. Do not parse it." }
+        reason: { type: string, description: "A stable, machine-readable cause, when there is one." }
+        path: { type: string, description: "The request field at fault." }
+        need: { type: string, description: "The grant a 403 asks for, `app:write` for example." }
+        retry_after_s: { type: integer }
+    Sha256:
+      type: string
+      pattern: "^[0-9a-f]{64}$"
+    Stored:
+      type: object
+      required: [sha256, size, stored]
+      properties:
+        sha256: { $ref: "#/components/schemas/Sha256" }
+        size: { type: integer }
+        stored: { type: boolean, description: "False when the Cloud already had these bytes." }
+    MissingList:
+      type: object
+      required: [missing]
+      properties:
+        missing: { type: array, items: { $ref: "#/components/schemas/Sha256" } }
+    GenerationWritten:
+      type: object
+      required: [app_id, record_generation]
+      additionalProperties: true
+      description: "Other fields may be present and should be ignored."
+      properties:
+        app_id: { type: string }
+        record_generation: { type: integer, description: "Wait for `apply.applied_generation` of the app to reach this." }
+    SecretWritten:
+      type: object
+      required: [app_id, record_generation, name]
+      properties:
+        app_id: { type: string }
+        record_generation: { type: integer }
+        name: { type: string }
+    SecretsPatch:
+      type: object
+      additionalProperties: false
+      properties:
+        set:
+          type: object
+          additionalProperties: { type: string }
+        delete:
+          type: array
+          items: { type: string }
+    HostsPatch:
+      type: object
+      additionalProperties: false
+      properties:
+        add: { type: array, maxItems: 64, items: { type: string } }
+        remove: { type: array, maxItems: 64, items: { type: string } }
+    Whoami:
+      type: object
+      description: "For a team key. (A different shape comes back for a signed-in browser session; it is not part of this API.)"
+      required: [kind, organization]
+      properties:
+        kind: { type: string, const: apikey }
+        organization: { type: string, description: "The team's id." }
+        organization_slug: { type: [string, "null"], description: "The `<team>` in `<project>.<team>.sproutboat.app`." }
+        organization_name: { type: [string, "null"] }
+        key:
+          type: object
+          properties:
+            id: { type: string }
+            name: { type: [string, "null"] }
+            start: { type: [string, "null"], description: "The first characters of the key, for recognition." }
+            permissions:
+              type: [object, "null"]
+              description: "Grants by resource, for example `{\"app\": [\"read\", \"write\"], \"secret\": [\"list\", \"write\"]}`."
+              additionalProperties: { type: array, items: { type: string } }
+            expires_at: { type: [string, "null"], format: date-time }
+        created_by:
+          type: [object, "null"]
+          description: "The team member who created the key."
+          properties:
+            id: { type: string }
+            name: { type: string }
+            email: { type: string }
+    Binding:
+      type: object
+      description: |
+        One binding of an app. `name` is the variable the code sees (`[A-Za-z_][A-Za-z0-9_]*`). There is no separate
+        provisioning call: `kv`, `d1`, `r2` and `queue` need a `resource_id` that **you choose** (1 to 64 lowercase letters,
+        digits, `_` or `-`); each app's storage is private to it, so the id is a name within the app, and the host creates
+        the storage on first use. The CLI uses the binding name, lowercased, as the id (a queue's name for a queue).
+        Other kinds take `resource_id: null`.
+      required: [name, kind, resource_id, config]
+      additionalProperties: false
+      properties:
+        name: { type: string }
+        kind: { type: string, enum: [kv, d1, r2, queue, do, ae, ratelimit, assets, secret, service] }
+        resource_id: { type: [string, "null"], pattern: "^[a-z0-9][a-z0-9_-]{0,63}$" }
+        config:
+          type: object
+          description: |
+            By kind: `do` `{class_name}` (the exported Durable Object class); `ratelimit` `{limit, period}`; `queue`
+            `{queue, retry_delay?}`; `service` `{}` with the callee in the spec's `services`; the others `{}`.
+          additionalProperties: true
+    QueueConsumer:
+      type: object
+      required: [queue, max_batch_size, max_batch_timeout_ms, max_retries, dead_letter_queue]
+      additionalProperties: false
+      properties:
+        queue: { type: string, pattern: "^[a-z0-9][a-z0-9_-]{0,63}$" }
+        max_batch_size: { type: integer, minimum: 1, maximum: 100 }
+        max_batch_timeout_ms: { type: integer, minimum: 0, maximum: 60000 }
+        max_retries: { type: integer, minimum: 0, maximum: 100 }
+        dead_letter_queue: { type: [string, "null"] }
+    Limits:
+      type: object
+      additionalProperties: false
+      description: "Per-app ceilings. A null or absent value means the platform default. A plan may cap them lower."
+      properties:
+        memory_mb: { type: [integer, "null"], minimum: 8, maximum: 4096 }
+        cpu_ms: { type: [integer, "null"], minimum: 10, maximum: 600000 }
+        wall_ms: { type: [integer, "null"], minimum: 100, maximum: 600000 }
+        storage_mb: { type: [integer, "null"], minimum: 1, maximum: 1048576 }
+        rate_rps: { type: [integer, "null"], minimum: 0 }
+        rate_burst: { type: [integer, "null"], minimum: 1, description: "Needs `rate_rps`." }
+        ops_per_sec: { type: [integer, "null"], minimum: 1 }
+        egress_bytes_per_day: { type: [integer, "null"], minimum: 0 }
+    SpecShared:
+      type: object
+      properties:
+        active: { type: boolean, default: true }
+        hosts:
+          type: array
+          maxItems: 64
+          items: { type: string }
+          description: "The app's whole route list. Exclusive with `hosts_patch`."
+        hosts_patch: { $ref: "#/components/schemas/HostsPatch" }
+        bindings: { type: array, maxItems: 64, items: { $ref: "#/components/schemas/Binding" } }
+        services:
+          type: object
+          description: "Service bindings: binding name to the callee's `app_id` (from `GET /v1/apps`). Both apps must belong to the team and the callee cannot be the app itself. The runtime enables service bindings from compatibility date 2026-11-18 (CLI-enforced)."
+          additionalProperties: { type: string }
+        crons:
+          type: array
+          maxItems: 16
+          items: { type: string, maxLength: 128, description: "Five fields of digits, letters and `* , / -`." }
+        queue_consumers: { type: array, maxItems: 16, items: { $ref: "#/components/schemas/QueueConsumer" } }
+        limits: { $ref: "#/components/schemas/Limits" }
+        egress_policy_ref: { type: [string, "null"] }
+        assets_manifest_ref:
+          type: [string, "null"]
+          pattern: "^assets/[0-9a-f]{64}$"
+          description: "`assets/<sha256 of the uploaded manifest>`. The manifest must be uploaded first."
+    AppSpecInput:
+      description: "The body of `PUT /v1/apps/{project}`."
+      allOf:
+        - $ref: "#/components/schemas/SpecShared"
+        - type: object
+          required: [module]
+          properties:
+            module:
+              type: object
+              required: [sha256]
+              description: "The module the app runs, or one your team's builds produced. Take `module_sha256` from a build."
+              properties:
+                sha256: { $ref: "#/components/schemas/Sha256" }
+            secrets:
+              description: "Absent keeps the stored secrets, null clears them, an object replaces the set. Needs `secret:write`."
+              oneOf:
+                - type: object
+                  additionalProperties: { type: string }
+                - type: "null"
+            secrets_patch:
+              $ref: "#/components/schemas/SecretsPatch"
+    BuildSpec:
+      description: "The `spec` of a build request. Same as an app spec, without `module`, `secrets` and `secrets_patch`."
+      allOf:
+        - $ref: "#/components/schemas/SpecShared"
+    CreateBuildRequest:
+      type: object
+      required: [source_sha256, build]
+      additionalProperties: true
+      properties:
+        source_sha256: { $ref: "#/components/schemas/Sha256" }
+        kind: { type: string, enum: [generated], default: generated }
+        build:
+          type: object
+          required: [v, name]
+          properties:
+            v: { type: integer, const: 1 }
+            name: { type: string, description: "Must equal the project in the path." }
+            cli:
+              type: object
+              additionalProperties: true
+              description: "What produced the source: `{version, runtime?, toolchain?}`. Recorded and part of the cache key. Whole `build` object: at most 16 KiB."
+        spec: { $ref: "#/components/schemas/BuildSpec" }
+    Build:
+      type: object
+      required: [id, project, state]
+      additionalProperties: true
+      properties:
+        id: { type: string, format: uuid }
+        project: { type: string }
+        state: { type: string, enum: [queued, building, ready, failed, canceled] }
+        cached: { type: boolean, description: "True when the result came from an identical earlier build." }
+        position: { type: [integer, "null"], description: "Place in the queue while `queued`." }
+        waiting: { type: [string, "null"], description: "Why a queued build is held back (for example waiting for memory). Not a failure." }
+        superseded: { type: boolean, description: "A newer deploy of the project overtook this build; it did not touch the app." }
+        expected_s: { type: [integer, "null"], description: "Estimated seconds to finish. An estimate, not a promise." }
+        estimated_start_s: { type: [integer, "null"] }
+        error:
+          type: [object, "null"]
+          description: "Set when `failed` or `canceled`. `code` is one of `prepare_failed`, `prepare_timeout`, `compile_failed`, `compile_timeout`, `abi_rejected`, `input_invalid`, `timeout`, `resource_exceeded`, `canceled`, `builder_error`, `apply_failed`, `queue_timeout`, `builder_lost`; `message` is the build output's reason."
+          properties:
+            code: { type: string }
+            message: { type: string }
+        module_sha256: { type: [string, "null"], description: "The module this build produced, once `ready`." }
+        record_generation: { type: [integer, "null"], description: "The app generation the build wrote, once `ready`. Wait for this to be applied." }
+        hosts: { type: array, items: { type: string } }
+        created_by:
+          type: [object, "null"]
+          properties:
+            name: { type: string }
+            via: { type: [string, "null"] }
+        trigger: { type: string, description: "What started it: `cli`, `git`, `dashboard` or `operator`." }
+        queued_at: { type: string, format: date-time }
+        started_at: { type: [string, "null"], format: date-time }
+        finished_at: { type: [string, "null"], format: date-time }
+        stats:
+          type: object
+          properties:
+            wall_ms: { type: [integer, "null"] }
+            cpu_ms: { type: [integer, "null"] }
+            peak_memory_bytes: { type: [integer, "null"] }
+            memory_cap_bytes: { type: [integer, "null"] }
+            module_bytes: { type: [integer, "null"] }
+    ApplyState:
+      type: [object, "null"]
+      description: |
+        Whether a host has applied the app's record. Null until the first apply was attempted. `state` is
+        `applied`, `failed` or `fenced`. The app is live at generation N when `state` is `applied` and
+        `applied_generation` is at least N (an `applied` row with an older generation means keep polling). The CLI gives
+        up on `failed` and `fenced` and shows `error`. **Uncertain:** the Cloud may retry a `failed` apply on its own
+        (`attempts`, `next_attempt_at` are in the row), so a provider may prefer to keep polling until its own timeout.
+      additionalProperties: true
+      properties:
+        state: { type: string, enum: [applied, failed, fenced] }
+        applied_generation: { type: [integer, "null"] }
+        error: { type: [string, "null"] }
+        attempts: { type: integer }
+        next_attempt_at: { type: [string, "null"], format: date-time }
+        updated_at: { type: string, format: date-time }
+    RouteView:
+      type: object
+      properties:
+        key: { type: string, description: "The route as stored, `host` or `host/prefix`." }
+        host: { type: string }
+        path: { type: string }
+        kind: { type: string, enum: [platform, custom] }
+        cert:
+          type: [object, "null"]
+          description: "Certificate state of the name, or null when not checked."
+          properties:
+            state: { type: string, enum: [pending, ready, failed, checking] }
+            error: { type: [string, "null"] }
+            expires_at: { type: [string, "null"], format: date-time }
+    AppSummary:
+      type: object
+      properties:
+        project: { type: string }
+        app_id: { type: string }
+        record_generation: { type: integer }
+        updated_at: { type: string, format: date-time }
+        hosts: { type: array, items: { type: string } }
+        created_by: { type: [string, "null"] }
+        secrets: { type: [array, "null"], items: { type: string }, description: "Secret names; null without `secret:list`." }
+        apply: { $ref: "#/components/schemas/ApplyState" }
+    App:
+      type: object
+      properties:
+        app_id: { type: string }
+        project: { type: string }
+        record_generation: { type: integer, description: "Increases with every write to the app." }
+        spec:
+          allOf:
+            - $ref: "#/components/schemas/SpecShared"
+            - type: object
+              properties:
+                module:
+                  type: object
+                  properties:
+                    sha256: { $ref: "#/components/schemas/Sha256" }
+                    vid: { type: string }
+                    ref: { type: [string, "null"] }
+                secrets: { type: [array, "null"], items: { type: string }, description: "Secret names; null without `secret:list`." }
+        routes: { type: array, items: { $ref: "#/components/schemas/RouteView" } }
+        placement:
+          type: [object, "null"]
+          additionalProperties: true
+          description: "Where the app runs. `region` is informational; other fields should be ignored."
+          properties:
+            region: { type: [string, "null"] }
+        runtime:
+          type: [object, "null"]
+          additionalProperties: true
+          description: "Live state, for example `state`, `memory_bytes`, `last_wake_at`, `reported_at`. Null until a host has reported."
+        apply: { $ref: "#/components/schemas/ApplyState" }
+        live_build:
+          description: "The build behind the module the app runs; null for an app that was not built by the build service."
+          oneOf: [{ $ref: "#/components/schemas/Build" }, { type: "null" }]
+        previous_build:
+          description: "The build before it that made a different module (what a redeploy of the previous version goes back to)."
+          oneOf: [{ $ref: "#/components/schemas/Build" }, { type: "null" }]
+        latest_build:
+          description: "The newest build of the app in any state."
+          oneOf: [{ $ref: "#/components/schemas/Build" }, { type: "null" }]
+        updated_at: { type: string, format: date-time }
+    AssetManifest:
+      type: object
+      required: [notFound, runSproutFirst, files]
+      additionalProperties: false
+      properties:
+        notFound:
+          type: string
+          enum: [none, single-page-application, 404-page]
+          description: "What a path that is no file answers."
+        runSproutFirst:
+          description: "`true`, `false`, or a list of `/`-anchored globs that go to the app before an asset of the same path."
+          oneOf:
+            - type: boolean
+            - type: array
+              items: { type: string }
+        files:
+          type: object
+          description: "Request path (absolute, normalized, for example `/index.html`) to file."
+          additionalProperties:
+            type: object
+            required: [hash, size, type]
+            additionalProperties: false
+            properties:
+              hash: { $ref: "#/components/schemas/Sha256" }
+              size: { type: integer, minimum: 0, maximum: 67108864 }
+              type: { type: string, description: "The content type served, `text/html; charset=utf-8` for example." }
+              br: { $ref: "#/components/schemas/AssetVariant" }
+              gz: { $ref: "#/components/schemas/AssetVariant" }
+        headers:
+          type: array
+          maxItems: 2000
+          items:
+            type: object
+            required: [pattern, set, unset]
+            additionalProperties: false
+            properties:
+              pattern: { type: string }
+              set: { type: array, items: { type: array, prefixItems: [{ type: string }, { type: string }], minItems: 2, maxItems: 2 } }
+              unset: { type: array, items: { type: string } }
+        redirects:
+          type: array
+          maxItems: 2000
+          items:
+            type: object
+            required: [from, to, status]
+            additionalProperties: false
+            properties:
+              from: { type: string }
+              to: { type: string }
+              status: { type: integer, minimum: 300, maximum: 399 }
+    AssetVariant:
+      type: object
+      description: "A precompressed copy (brotli or gzip) of the file that the edge serves to clients that accept it. Its blob must be uploaded too."
+      required: [hash, size]
+      additionalProperties: false
+      properties:
+        hash: { $ref: "#/components/schemas/Sha256" }
+        size: { type: integer, minimum: 0 }
+    DomainClaim:
+      type: object
+      properties:
+        host: { type: string }
+        state: { type: string, enum: [pending, verified, lost] }
+        method: { type: string, enum: [txt, operator] }
+        verified_at: { type: [string, "null"], format: date-time }
+        last_checked_at: { type: [string, "null"], format: date-time }
+        lost_at: { type: [string, "null"], format: date-time }
+        lost_reason: { type: [string, "null"] }
+        created_at: { type: string, format: date-time }
+        txt:
+          type: [object, "null"]
+          description: "The DNS record to publish while the claim is pending (and after a loss, to take the name back). Null once verified."
+          properties:
+            type: { type: string, const: TXT }
+            name: { type: string, examples: ["_sproutboat-challenge.app.example.com"] }
+            value: { type: string, examples: ["sproutboat-verify=..."] }
+        routes:
+          type: array
+          description: "The team's apps that route this host."
+          items:
+            type: object
+            properties:
+              project: { type: string }
+              key: { type: string }
