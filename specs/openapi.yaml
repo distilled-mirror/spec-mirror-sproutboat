@@ -47,31 +47,51 @@ info:
     ## Errors
 
     An error is a JSON object with a human-readable `error` string and, for most of them, a machine-readable
-    `reason`. Some add `path` (the field at fault), `need` (the missing grant) or `retry_after_s`. Branch on the
-    HTTP status and `reason`, never on the wording of `error`.
+    `reason`. Some add `path` (the field at fault), `need` (the missing grant) or a wait (`retry_after_s`; the
+    upload and data limits spell it `retry_after`). Branch on the HTTP status and `reason`, never on the wording of
+    `error`.
+
+    **Every documented `reason` has a schema of its own**, `Error<Reason>` in the components (for example
+    `ErrorBlobsMissing`, with its `missing` and `missing_count`), whose `reason` is a `const`. Each operation lists
+    the ones it can answer, per status, as a `oneOf` (with a `discriminator` on `reason` where every arm has one). The
+    list is checked against the Cloud's handlers whenever one is added, so a reason that is thrown is documented. A Cloud
+    may add reasons over time: treat an unknown `reason` like the rest of its status.
 
     ```json
     { "error": "hosts[0]: \"x.example.com\" is not a valid route (...)", "reason": "invalid", "path": "hosts[0]" }
     ```
 
-    Not every error has a `reason`: a missing app or build is `{"error": "no such app"}` (404), a wrong method is
-    405 `{"error": "method not allowed"}`, an unknown path is 404 `{"error": "not found"}`, and an unexpected failure
-    is 500 `{"error": "internal error"}`. Statuses: 400 invalid input, 401 missing, invalid, expired or revoked key,
-    403 the key lacks a grant (`reason: forbidden`, `need`) or may not do this (`host-not-yours`), 404 not found
-    (another team's app is also 404), 409 conflict, 413 too large, 429 limited, 503 temporarily unavailable.
+    Not every error has a `reason` (schema `ErrorPlain`): a missing app or build is `{"error": "no such app"}` (404), a
+    wrong method is 405 `{"error": "method not allowed"}`, an unknown path is 404 `{"error": "not found"}`, and an
+    unexpected failure is 500 `{"error": "internal error"}`. The one 403 without a `reason` is
+    `{"error": "module-upload-disabled", "message": "..."}` (`ErrorModuleUploadDisabled`): read `error`.
+    Statuses: 400 invalid input, 401 missing, invalid, expired or revoked key, 403 the key lacks a grant
+    (`reason: forbidden`, `need`), may not use a route (`host-not-yours`) or is over a quota, 404 not found (another
+    team's app is also 404), 409 conflict, 411 a chunked upload without a declared length, 413 too large (`too-large`,
+    on JSON bodies as well: 256 KiB, or 1 MiB for specs, builds, secrets and route edits), 422 a D1 statement over the
+    host's memory, 429 limited, 502 the host agent misbehaved, 503 temporarily unavailable, 504 the host timed out,
+    507 an app's storage on its host is full.
 
-    Free alpha quotas apply per team: apps per team, memory per app (`limits.memory_mb`), builds that compile per
-    rolling 24 hours, and storage (`limits.storage_mb` and the team's static assets). `GET /v1/limits` returns the
-    team's limits and usage. Over a limit: 403 with `reason` `quota-apps`, `quota-memory` or `quota-storage` when an app
-    is written, 429 with `reason: quota-builds`, `retry_after_s` and a `Retry-After` header when a build is started.
-    The `error` text is meant to be shown as it is. Treat any 403 or 429 with an unknown `reason` the same way.
+    Free alpha quotas apply per team (one team per user, and a team's URL name, its slug, never changes): apps per team,
+    what an app may ask for in `limits` (memory, storage, CPU time, wall time, request rate, binding operations), builds
+    that compile per rolling 24 hours, bytes of new sources and of new static assets per rolling 24 hours, and storage
+    (`limits.storage_mb` and the team's static assets). `GET /v1/limits` returns the team's limits and usage. Over a
+    limit: 403 with `reason` `quota-apps`, `quota-memory`, `quota-storage`, `quota-cpu`, `quota-wall`, `quota-rate` or
+    `quota-ops` when an app is written (a `limits` value over its ceiling is refused, never clamped; an app already over a
+    ceiling keeps it and can be lowered or redeployed, not raised), 429 with `reason: quota-builds` when a build is
+    started, and 429 with `reason: quota-upload` when a source or a blob would pass the 24-hour byte budget. The 429s carry
+    `retry_after_s` and a `Retry-After` header. The `error` text is meant to be shown as it is. Treat any 403 or 429 with
+    an unknown `reason` the same way.
 
     ## Rate limits
 
     - **Per key:** 600 requests a minute. Over it: 429, `reason: key-rate-limited`, `retry_after_s`, and a
       `Retry-After` header.
     - **Data routes** (D1 query, R2 objects): per team, 2 requests in flight and a bucket of 60 refilled at 10 a second.
-      Over it: 429, `reason: rate`, `Retry-After` header. Counted per API process, so treat them as approximate.
+      Over it: 429, `reason: rate`, `retry_after`, `Retry-After` header. Counted per API process, so treat them as approximate.
+    - **Uploads** (`PUT /v1/sources/...`, `PUT /v1/assets/blobs/...`, `PUT /v1/assets/manifests/...`): per team, not per key.
+      Over the rate: 429, `reason: upload-rate`, `retry_after`, `Retry-After`. Blob uploads in flight at once are bounded per
+      API process: 429, `reason: busy`, `Retry-After: 5`. New bytes per rolling 24 hours: 429, `reason: quota-upload`.
     - **Builds:** per team, 3 builds queued or running, 20 new (not cached) builds an hour; platform-wide, a queue of
       50. See `POST /v1/apps/{project}/builds` for the reasons.
     - **Domains:** 10 custom domains per team, one verification check per domain every 10 seconds, 20 new
@@ -82,7 +102,10 @@ info:
     There is no `Idempotency-Key` header. What is safe to repeat:
 
     - Uploads by sha256 (`PUT /v1/sources/...`, `PUT /v1/assets/blobs/...`, `PUT /v1/assets/manifests/...`) are
-      content-addressed: sending the same bytes again is a no-op (`stored: false`).
+      content-addressed: sending the same bytes again is a no-op (`stored: false`, and no quota is charged). What a team
+      has uploaded is private to it: `POST /v1/sources/missing` and `POST /v1/assets/missing` answer for the team's own
+      uploads only (bytes another team holds are reported missing until you send them), a manifest may name only blobs the
+      team uploaded, and `GET /v1/assets/manifests/{sha256}` is 404 for a manifest the team neither uploaded nor uses.
     - `POST /v1/apps/{project}/builds` with the same source, `build` and runtime answers from a cache (HTTP 200, a
       `ready` build with `cached: true`) instead of building again; the app still gets a new `record_generation`.
     - `POST /v1/domains` for a host you already claimed returns the existing claim (200).
@@ -203,6 +226,7 @@ paths:
                 properties:
                   revoked: { type: boolean, const: true }
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/KeyRateLimited" }
   /v1/apps:
     get:
       operationId: listApps
@@ -263,7 +287,10 @@ paths:
         routes and secrets alone. Omitting `secrets` keeps the stored secrets; `secrets: null` clears them; an object
         replaces the whole set. Setting any secret needs `secret:write` in addition to `app:write`.
 
-        Unknown keys are refused by name (400, `reason: invalid`, `path`). Route keys: a team may add only
+        Unknown keys are refused by name (400, `reason: invalid`, `path`). Every value of `limits` the team may set is checked
+        against the account's ceilings (`GET /v1/limits`): over one is 403 `quota-memory`, `quota-storage`, `quota-cpu`,
+        `quota-wall`, `quota-rate` or `quota-ops`, never clamped, and a new app over the app quota is 403 `quota-apps`. An app
+        already over a ceiling keeps its value and can be lowered or redeployed, not raised. Route keys: a team may add only
         `<name>.<team slug>.sproutboat.app` (any path under it) or a hostname it has verified as a custom domain;
         another route is 403 `host-not-yours`. A route another app holds is 409 `route-taken`.
       x-sproutboat-permission: "app:write"
@@ -280,9 +307,10 @@ paths:
               schema: { $ref: "#/components/schemas/GenerationWritten" }
         "400": { $ref: "#/components/responses/Invalid" }
         "401": { $ref: "#/components/responses/Unauthorized" }
-        "403": { $ref: "#/components/responses/Forbidden" }
-        "409": { $ref: "#/components/responses/Conflict" }
-        "429": { $ref: "#/components/responses/Limited" }
+        "403": { $ref: "#/components/responses/ForbiddenApp" }
+        "409": { $ref: "#/components/responses/ConflictRoutes" }
+        "413": { $ref: "#/components/responses/TooLarge" }
+        "429": { $ref: "#/components/responses/KeyRateLimited" }
     delete:
       operationId: deleteApp
       tags: [Apps]
@@ -312,6 +340,7 @@ paths:
       operationId: sourcesMissing
       tags: [Uploads]
       summary: "Missing sources"
+      description: "Send up to 100 digests; the answer lists the ones this team has not uploaded. A source another team holds is reported missing until you upload the bytes yourself."
       x-sproutboat-permission: "app:write"
       requestBody:
         required: true
@@ -334,6 +363,8 @@ paths:
         "400": { $ref: "#/components/responses/Invalid" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
+        "413": { $ref: "#/components/responses/TooLarge" }
+        "429": { $ref: "#/components/responses/KeyRateLimited" }
   /v1/sources/{sha256}:
     parameters:
       - $ref: "#/components/parameters/sha256"
@@ -344,13 +375,19 @@ paths:
       description: |
         The bytes of the app's generated JavaScript, as `application/octet-stream`. At most 8 MiB, non-empty, valid
         UTF-8, and `sha256` must be the lowercase hex SHA-256 of exactly these bytes (else 400 `digest mismatch`).
-        Idempotent. Not tied to an app until a build names it.
+        Idempotent. Not tied to an app until a build names it. The source belongs to the uploading team: another team's
+        build cannot name it. New bytes count against the team's 24-hour budget (429 `quota-upload`), and uploads are
+        rate-limited per team (429 `upload-rate`). A source no build used is deleted after a grace period of at least 48 hours.
       x-sproutboat-permission: "app:write"
       requestBody:
         required: true
         content:
           application/octet-stream:
-            schema: { type: string, format: binary }
+            schema:
+              type: string
+              format: binary
+              contentMediaType: application/octet-stream
+              description: "The whole request body is the app's generated JavaScript: at most 8 MiB, non-empty, valid UTF-8. Send it with `Content-Type: application/octet-stream`; `sha256` in the path must be the SHA-256 of exactly these bytes."
       responses:
         "200":
           description: "Stored."
@@ -361,12 +398,13 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "413": { $ref: "#/components/responses/TooLarge" }
+        "429": { $ref: "#/components/responses/LimitedSource" }
   /v1/assets/missing:
     post:
       operationId: assetsMissing
       tags: [Uploads]
       summary: "Missing asset blobs"
-      description: "Send the sha256 of every file (and precompressed variant) in the manifest; upload the ones returned."
+      description: "Send the sha256 of every file (and precompressed variant) in the manifest; upload the ones returned. Answers for the team's own uploads only: a blob another team holds is reported missing until you upload the bytes yourself."
       x-sproutboat-permission: "app:write"
       requestBody:
         required: true
@@ -389,6 +427,8 @@ paths:
         "400": { $ref: "#/components/responses/Invalid" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
+        "413": { $ref: "#/components/responses/TooLarge" }
+        "429": { $ref: "#/components/responses/KeyRateLimited" }
   /v1/assets/blobs/{sha256}:
     parameters:
       - $ref: "#/components/parameters/sha256"
@@ -396,13 +436,20 @@ paths:
       operationId: putAssetBlob
       tags: [Uploads]
       summary: "Upload one asset file"
-      description: "Raw bytes, at most 64 MiB; `sha256` must match them. Idempotent. The CLI uploads up to 4 at a time."
+      description: |
+        Raw bytes, at most 64 MiB; `sha256` must match them. Idempotent. The CLI uploads up to 4 at a time. New bytes count
+        against the team's 24-hour budget of static assets (429 `quota-upload`, checked from `Content-Length` before a byte
+        is read); uploads are rate-limited per team (429 `upload-rate`) and bounded in flight (429 `busy`, retry in 5 s).
       x-sproutboat-permission: "app:write"
       requestBody:
         required: true
         content:
           application/octet-stream:
-            schema: { type: string, format: binary }
+            schema:
+              type: string
+              format: binary
+              contentMediaType: application/octet-stream
+              description: "The whole request body is the file's bytes: at most 64 MiB. Send it with `Content-Type: application/octet-stream`; `sha256` in the path must be the SHA-256 of exactly these bytes."
       responses:
         "200":
           description: "Stored."
@@ -413,6 +460,7 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "413": { $ref: "#/components/responses/TooLarge" }
+        "429": { $ref: "#/components/responses/LimitedBlob" }
   /v1/assets/manifests/{sha256}:
     parameters:
       - $ref: "#/components/parameters/sha256"
@@ -424,7 +472,8 @@ paths:
         The manifest JSON (see `AssetManifest`), at most 4 MiB, 20,000 files and 512 MiB in total, uploaded after every
         blob it names. `sha256` is the digest of the manifest's exact bytes; the app then references it as
         `assets_manifest_ref: "assets/<sha256>"`. If a blob is missing the answer is 409 `blobs-missing` with up to 100
-        digests in `missing` (and the full count in `missing_count`). Idempotent.
+        digests in `missing` (and the full count in `missing_count`); only blobs the team uploaded itself count as present.
+        Idempotent.
       x-sproutboat-permission: "app:write"
       requestBody:
         required: true
@@ -448,22 +497,14 @@ paths:
         "400": { $ref: "#/components/responses/Invalid" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
-        "409":
-          description: "Blobs the manifest names are not uploaded (`reason: blobs-missing`)."
-          content:
-            application/json:
-              schema:
-                allOf:
-                  - $ref: "#/components/schemas/Error"
-                  - type: object
-                    properties:
-                      missing: { type: array, items: { $ref: "#/components/schemas/Sha256" } }
-                      missing_count: { type: integer }
+        "409": { $ref: "#/components/responses/ConflictBlobs" }
         "413": { $ref: "#/components/responses/TooLarge" }
+        "429": { $ref: "#/components/responses/LimitedManifest" }
     get:
       operationId: getAssetManifest
       tags: [Uploads]
       summary: "Read an assets manifest"
+      description: "Only for a manifest the team uploaded, or one of its apps names; any other digest is 404 (so the answer does not say whether the platform holds it)."
       x-sproutboat-permission: "app:read"
       responses:
         "200":
@@ -475,6 +516,7 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/KeyRateLimited" }
   /v1/apps/{project}/builds:
     parameters:
       - $ref: "#/components/parameters/project"
@@ -491,7 +533,10 @@ paths:
         `spec` takes the same keys as `PUT /v1/apps/{project}` **except** `module`, `secrets` and `secrets_patch`
         (400 `invalid`, `path: spec.<key>`): it is stored in plain text, so set secrets with `PATCH
         /v1/apps/{project}/secrets` after the build is `ready`. Use `hosts_patch` rather than `hosts` to leave an app's
-        other routes alone. Route ownership and conflicts are checked up front, and again when the build lands.
+        other routes alone. Route ownership and conflicts are checked up front, and again when the build lands, and so are
+        the `limits` the spec asks for against the account's ceilings (403 `quota-*`, as for `PUT /v1/apps/{project}`).
+        The source must be one this team uploaded (a digest another team holds is 409 `source-missing`). The build quota
+        is 429 `quota-builds`.
 
         `build` is `{"v": 1, "name": "<project>", "cli": {"version": "...", "runtime": "...", "toolchain": "..."}}`;
         `name` must equal the project. `kind` must be `generated` (the only kind that exists). The source must already
@@ -515,26 +560,11 @@ paths:
               schema: { $ref: "#/components/schemas/Build" }
         "400": { $ref: "#/components/responses/Invalid" }
         "401": { $ref: "#/components/responses/Unauthorized" }
-        "403": { $ref: "#/components/responses/Forbidden" }
-        "409": { $ref: "#/components/responses/Conflict" }
+        "403": { $ref: "#/components/responses/ForbiddenBuild" }
+        "409": { $ref: "#/components/responses/ConflictBuild" }
         "413": { $ref: "#/components/responses/TooLarge" }
-        "429":
-          description: |
-            Limited. `reason` is `team-queue-full` (3 builds already queued or running for the team), `team-hourly-limit`
-            (20 builds in the last hour), `queue-full` (platform-wide queue; carries `retry_after_s`, `queue_length`,
-            `drain_s` and a `Retry-After` header) `key-rate-limited` or `quota-builds` (the free alpha builds per 24 hours; carries `retry_after_s` and a `Retry-After` header).
-          headers:
-            Retry-After: { $ref: "#/components/headers/RetryAfter" }
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/Error" }
-        "503":
-          description: |
-            Builds are not available right now: `reason: builds-disabled` (this Cloud does not build) or `no-builder`
-            (none is ready; retry in a few minutes).
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/Error" }
+        "429": { $ref: "#/components/responses/LimitedBuild" }
+        "503": { $ref: "#/components/responses/UnavailableBuild" }
     get:
       operationId: listBuilds
       tags: [Builds]
@@ -560,11 +590,8 @@ paths:
         "400": { $ref: "#/components/responses/Invalid" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
-        "503":
-          description: "The audit log could not record the request (`reason: audit-unavailable`); nothing was served. Retry shortly."
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/Error" }
+        "429": { $ref: "#/components/responses/KeyRateLimited" }
+        "503": { $ref: "#/components/responses/UnavailableAudit" }
   /v1/builds/{id}:
     parameters:
       - $ref: "#/components/parameters/buildId"
@@ -583,6 +610,7 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/KeyRateLimited" }
     delete:
       operationId: cancelBuild
       tags: [Builds]
@@ -600,6 +628,7 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/KeyRateLimited" }
   /v1/builds/{id}/events:
     parameters:
       - $ref: "#/components/parameters/buildId"
@@ -645,6 +674,7 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/KeyRateLimited" }
   /v1/apps/{project}/secrets:
     parameters:
       - $ref: "#/components/parameters/project"
@@ -669,6 +699,7 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/KeyRateLimited" }
     patch:
       operationId: patchSecrets
       tags: [Secrets]
@@ -698,6 +729,8 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
+        "413": { $ref: "#/components/responses/TooLarge" }
+        "429": { $ref: "#/components/responses/KeyRateLimited" }
   /v1/apps/{project}/secrets/{name}:
     parameters:
       - $ref: "#/components/parameters/project"
@@ -719,7 +752,7 @@ paths:
               type: object
               required: [value]
               properties:
-                value: { type: string }
+                value: { type: string, format: password, writeOnly: true, x-sensitive: true, description: "The secret's value. Never returned by any route; keep it out of logs." }
       responses:
         "200":
           description: "Written."
@@ -730,6 +763,8 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
+        "413": { $ref: "#/components/responses/TooLarge" }
+        "429": { $ref: "#/components/responses/KeyRateLimited" }
     delete:
       operationId: deleteSecret
       tags: [Secrets]
@@ -745,6 +780,7 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/KeyRateLimited" }
   /v1/apps/{project}/routes:
     parameters:
       - $ref: "#/components/parameters/project"
@@ -778,9 +814,11 @@ paths:
                   hosts: { type: array, items: { type: string } }
         "400": { $ref: "#/components/responses/Invalid" }
         "401": { $ref: "#/components/responses/Unauthorized" }
-        "403": { $ref: "#/components/responses/Forbidden" }
+        "403": { $ref: "#/components/responses/ForbiddenRoutes" }
         "404": { $ref: "#/components/responses/NotFound" }
-        "409": { $ref: "#/components/responses/Conflict" }
+        "409": { $ref: "#/components/responses/ConflictRoutes" }
+        "413": { $ref: "#/components/responses/TooLarge" }
+        "429": { $ref: "#/components/responses/KeyRateLimited" }
   /v1/domains:
     get:
       operationId: listDomains
@@ -801,6 +839,7 @@ paths:
                     items: { $ref: "#/components/schemas/DomainClaim" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/KeyRateLimited" }
     post:
       operationId: addDomain
       tags: [Routes and domains]
@@ -833,11 +872,12 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/DomainClaim" }
-        "400": { $ref: "#/components/responses/Invalid" }
+        "400": { $ref: "#/components/responses/InvalidHost" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
-        "409": { $ref: "#/components/responses/Conflict" }
-        "429": { $ref: "#/components/responses/Limited" }
+        "409": { $ref: "#/components/responses/ConflictDomainAdd" }
+        "413": { $ref: "#/components/responses/TooLarge" }
+        "429": { $ref: "#/components/responses/LimitedDomainAdd" }
   /v1/domains/{host}:
     parameters:
       - $ref: "#/components/parameters/host"
@@ -860,7 +900,8 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
-        "409": { $ref: "#/components/responses/Conflict" }
+        "409": { $ref: "#/components/responses/ConflictDomainInUse" }
+        "429": { $ref: "#/components/responses/KeyRateLimited" }
   /v1/domains/{host}/verify:
     parameters:
       - $ref: "#/components/parameters/host"
@@ -880,12 +921,12 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/DomainClaim" }
-        "400": { $ref: "#/components/responses/Invalid" }
+        "400": { $ref: "#/components/responses/InvalidVerify" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
-        "404": { $ref: "#/components/responses/NotFound" }
-        "409": { $ref: "#/components/responses/Conflict" }
-        "429": { $ref: "#/components/responses/Limited" }
+        "404": { $ref: "#/components/responses/NotFoundClaim" }
+        "409": { $ref: "#/components/responses/ConflictVerify" }
+        "429": { $ref: "#/components/responses/LimitedVerify" }
   /v1/domains/{host}/status:
     parameters:
       - $ref: "#/components/parameters/host"
@@ -925,6 +966,7 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/KeyRateLimited" }
   /v1/apps/{project}/d1/{binding}/query:
     parameters:
       - $ref: "#/components/parameters/project"
@@ -979,17 +1021,18 @@ paths:
                         success: { type: boolean }
                         results: { type: array, items: { type: object, additionalProperties: true } }
                         meta: { type: object, additionalProperties: true }
-        "400": { $ref: "#/components/responses/Invalid" }
+        "400": { $ref: "#/components/responses/InvalidQuery" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
-        "404": { $ref: "#/components/responses/NotFound" }
-        "413": { $ref: "#/components/responses/TooLarge" }
-        "429": { $ref: "#/components/responses/Limited" }
-        "503":
-          description: "The app's host is not reachable, or the audit log could not record the request (`reason: audit-unavailable`). Retry shortly."
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/Error" }
+        "404": { $ref: "#/components/responses/NotFoundData" }
+        "409": { $ref: "#/components/responses/ConflictData" }
+        "413": { $ref: "#/components/responses/TooLargeQuery" }
+        "422": { $ref: "#/components/responses/Unprocessable" }
+        "429": { $ref: "#/components/responses/LimitedData" }
+        "502": { $ref: "#/components/responses/BadGateway" }
+        "503": { $ref: "#/components/responses/UnavailableData" }
+        "504": { $ref: "#/components/responses/GatewayTimeout" }
+        "507": { $ref: "#/components/responses/InsufficientStorage" }
   /v1/apps/{project}/r2/{bucket}/objects/{key}:
     parameters:
       - $ref: "#/components/parameters/project"
@@ -1001,9 +1044,15 @@ paths:
       - name: key
         in: path
         required: true
-        description: "The object key. May contain `/`, which must stay literal in the path. Percent-encoded dots, slashes and backslashes are refused."
-        schema: { type: string }
+        description: |
+          The object key, the rest of the path after `/objects/`. It spans path segments: each `/` in the key is a literal `/` in
+          the URL (`assets/logo.png` is `/objects/assets/logo.png`), and every segment is percent-encoded on its own. A key is 1 to
+          1024 bytes of UTF-8 with no control character, backslash, empty segment or `.` or `..` segment; a percent-encoded dot,
+          slash or backslash in the path is refused (400 `invalid`, `path: key`). OpenAPI has no way to mark a path parameter as
+          spanning segments (`allowReserved` is formally for query parameters); a generator that does not read it as such needs a
+          rest-of-path label (`{key+}`) for this one parameter.
         allowReserved: true
+        schema: { type: string, minLength: 1, examples: ["assets/logo.png"] }
     get:
       operationId: getR2Object
       tags: [Data]
@@ -1016,13 +1065,23 @@ paths:
       responses:
         "200":
           description: "The object."
+          headers:
+            ETag: { description: "The object's entity tag.", schema: { type: string } }
           content:
             application/octet-stream:
-              schema: { type: string, format: binary }
+              schema:
+                type: string
+                format: binary
+                contentMediaType: application/octet-stream
+                description: "The whole response body is the object's bytes."
+        "400": { $ref: "#/components/responses/Invalid" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
-        "404": { $ref: "#/components/responses/NotFound" }
-        "429": { $ref: "#/components/responses/Limited" }
+        "404": { $ref: "#/components/responses/NotFoundData" }
+        "429": { $ref: "#/components/responses/LimitedData" }
+        "502": { $ref: "#/components/responses/BadGateway" }
+        "503": { $ref: "#/components/responses/UnavailableData" }
+        "504": { $ref: "#/components/responses/GatewayTimeout" }
     put:
       operationId: putR2Object
       tags: [Data]
@@ -1033,7 +1092,11 @@ paths:
         required: true
         content:
           application/octet-stream:
-            schema: { type: string, format: binary }
+            schema:
+              type: string
+              format: binary
+              contentMediaType: application/octet-stream
+              description: "The whole request body is the object's bytes: at most 64 MiB. Send it with `Content-Type: application/octet-stream` and declare the length (`Content-Length`, or `X-Declared-Length` for a chunked body)."
       responses:
         "200":
           description: "Stored."
@@ -1048,9 +1111,14 @@ paths:
         "400": { $ref: "#/components/responses/Invalid" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
-        "404": { $ref: "#/components/responses/NotFound" }
+        "404": { $ref: "#/components/responses/NotFoundData" }
+        "411": { $ref: "#/components/responses/LengthRequired" }
         "413": { $ref: "#/components/responses/TooLarge" }
-        "429": { $ref: "#/components/responses/Limited" }
+        "429": { $ref: "#/components/responses/LimitedData" }
+        "502": { $ref: "#/components/responses/BadGateway" }
+        "503": { $ref: "#/components/responses/UnavailableData" }
+        "504": { $ref: "#/components/responses/GatewayTimeout" }
+        "507": { $ref: "#/components/responses/InsufficientStorage" }
     delete:
       operationId: deleteR2Object
       tags: [Data]
@@ -1067,10 +1135,14 @@ paths:
                 properties:
                   key: { type: string }
                   deleted: { type: boolean, const: true }
+        "400": { $ref: "#/components/responses/Invalid" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
-        "404": { $ref: "#/components/responses/NotFound" }
-        "429": { $ref: "#/components/responses/Limited" }
+        "404": { $ref: "#/components/responses/NotFoundData" }
+        "429": { $ref: "#/components/responses/LimitedData" }
+        "502": { $ref: "#/components/responses/BadGateway" }
+        "503": { $ref: "#/components/responses/UnavailableData" }
+        "504": { $ref: "#/components/responses/GatewayTimeout" }
   /v1/apps/{project}/metrics:
     parameters:
       - $ref: "#/components/parameters/project"
@@ -1106,6 +1178,7 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/KeyRateLimited" }
   /v1/apps/{project}/events:
     parameters:
       - $ref: "#/components/parameters/project"
@@ -1145,6 +1218,7 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/KeyRateLimited" }
   /v1/notices:
     get:
       operationId: listNotices
@@ -1179,12 +1253,13 @@ paths:
                         updated_at: { type: string, format: date-time }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/KeyRateLimited" }
   /v1/limits:
     get:
       operationId: getLimits
       tags: [Meta]
       summary: "Get the team's limits and usage"
-      description: "The free alpha limits that apply to the team (defaults, with any limit raised for this team) and what it uses now. `null` is unlimited. Memory is a ceiling per app, so it has no usage."
+      description: "The free alpha limits that apply to the team (defaults, with any limit raised for this team) and what it uses now. `null` is unlimited. Memory, CPU, wall time, request rate and operations are ceilings on what an app may ask for in `limits`, so they have no usage."
       x-sproutboat-permission: "app:read"
       responses:
         "200":
@@ -1202,19 +1277,28 @@ paths:
                       apps: { type: [integer, "null"] }
                       memory_mb: { type: [integer, "null"], description: "MiB per app." }
                       builds_per_day: { type: [integer, "null"], description: "Builds that compile in a rolling 24 hours; cached builds are free." }
-                      storage_mb: { type: [integer, "null"] }
+                      storage_mb: { type: [integer, "null"], description: "MiB: the ceiling for `limits.storage_mb`, and the team's static assets together." }
+                      cpu_ms: { type: [integer, "null"], description: "Ceiling for `limits.cpu_ms`: milliseconds of CPU per request." }
+                      wall_ms: { type: [integer, "null"], description: "Ceiling for `limits.wall_ms`: milliseconds of wall time per request." }
+                      rate_rps: { type: [integer, "null"], description: "Ceiling for `limits.rate_rps` (requests per second per app); `limits.rate_burst` may be twice this. A rate limit cannot be lifted." }
+                      ops_per_sec: { type: [integer, "null"], description: "Ceiling for `limits.ops_per_sec`: binding operations per second." }
+                      source_mb_per_day: { type: [integer, "null"], description: "MiB of new sources the team may upload in a rolling 24 hours." }
+                      asset_mb_per_day: { type: [integer, "null"], description: "MiB of new static asset blobs the team may upload in a rolling 24 hours." }
                   overridden:
                     type: array
                     description: "The limits raised (or lowered) for this team."
-                    items: { type: string, enum: [apps, memory_mb, builds_per_day, storage_mb] }
+                    items: { type: string, enum: [apps, memory_mb, builds_per_day, storage_mb, cpu_ms, wall_ms, rate_rps, ops_per_sec, source_mb_per_day, asset_mb_per_day] }
                   usage:
                     type: object
                     properties:
                       apps: { type: integer }
                       builds_24h: { type: integer }
                       assets_mb: { type: number, description: "MiB of static assets across the team's apps." }
+                      sources_mb_24h: { type: number, description: "MiB of new sources the team uploaded in the last 24 hours (against `limits.source_mb_per_day`)." }
+                      assets_mb_24h: { type: number, description: "MiB of new asset blobs the team uploaded in the last 24 hours (against `limits.asset_mb_per_day`)." }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/KeyRateLimited" }
 components:
   securitySchemes:
     bearerKey:
@@ -1257,51 +1341,389 @@ components:
       schema: { type: string, examples: [app.example.com] }
   responses:
     Unauthorized:
-      description: "No key, or an invalid, expired or revoked key (`unknown or missing API token`, `invalid, expired or revoked API key`)."
+      description: "No key, or an invalid, expired or revoked key (`unknown or missing API token`, `invalid, expired or revoked API key`). No `reason`."
       content:
         application/json:
-          schema: { $ref: "#/components/schemas/Error" }
+          schema: { $ref: "#/components/schemas/ErrorPlain" }
     KeyRateLimited:
       description: "The key is over 600 requests a minute (`reason: key-rate-limited`, `retry_after_s`, `Retry-After`)."
       headers:
         Retry-After: { $ref: "#/components/headers/RetryAfter" }
       content:
         application/json:
-          schema: { $ref: "#/components/schemas/Error" }
+          schema: { $ref: "#/components/schemas/ErrorKeyRateLimited" }
     Forbidden:
-      description: |
-        The key lacks a grant (`reason: forbidden`, `need: "<resource>:<action>"`), may not use a route
-        (`host-not-yours`), or tried to place a module (the one answer without a `reason`: `{"error": "module-upload-disabled", "message": "..."}`). Quota refusals may also be 403.
+      description: "The key lacks a grant (`reason: forbidden`, `need: \"<resource>:<action>\"`)."
       content:
         application/json:
-          schema: { $ref: "#/components/schemas/Error" }
-    NotFound:
-      description: "No such app, build, secret or claim in this team (another team's resource looks the same)."
+          schema: { $ref: "#/components/schemas/ErrorForbidden" }
+    ForbiddenRoutes:
+      description: "The key lacks a grant (`forbidden`), or a route is not the team's to use (`host-not-yours`)."
       content:
         application/json:
-          schema: { $ref: "#/components/schemas/Error" }
+          schema:
+            oneOf:
+              - $ref: "#/components/schemas/ErrorForbidden"
+              - $ref: "#/components/schemas/ErrorHostNotYours"
+            discriminator:
+              propertyName: reason
+              mapping:
+                forbidden: "#/components/schemas/ErrorForbidden"
+                host-not-yours: "#/components/schemas/ErrorHostNotYours"
+    ForbiddenBuild:
+      description: "The key lacks a grant (`forbidden`), a route is not the team's to use (`host-not-yours`), or the spec's `limits` are over the account's ceilings (`quota-memory`, `quota-storage`, `quota-cpu`, `quota-wall`, `quota-rate`, `quota-ops`)."
+      content:
+        application/json:
+          schema:
+            oneOf:
+              - $ref: "#/components/schemas/ErrorForbidden"
+              - $ref: "#/components/schemas/ErrorHostNotYours"
+              - $ref: "#/components/schemas/ErrorQuotaMemory"
+              - $ref: "#/components/schemas/ErrorQuotaStorage"
+              - $ref: "#/components/schemas/ErrorQuotaCpu"
+              - $ref: "#/components/schemas/ErrorQuotaWall"
+              - $ref: "#/components/schemas/ErrorQuotaRate"
+              - $ref: "#/components/schemas/ErrorQuotaOps"
+            discriminator:
+              propertyName: reason
+              mapping:
+                forbidden: "#/components/schemas/ErrorForbidden"
+                host-not-yours: "#/components/schemas/ErrorHostNotYours"
+                quota-memory: "#/components/schemas/ErrorQuotaMemory"
+                quota-storage: "#/components/schemas/ErrorQuotaStorage"
+                quota-cpu: "#/components/schemas/ErrorQuotaCpu"
+                quota-wall: "#/components/schemas/ErrorQuotaWall"
+                quota-rate: "#/components/schemas/ErrorQuotaRate"
+                quota-ops: "#/components/schemas/ErrorQuotaOps"
+    ForbiddenApp:
+      description: "The key lacks a grant (`forbidden`); a route is not the team's to use (`host-not-yours`); the module is not one the team may place (`module-upload-disabled`, the one error with no `reason`: read `error`); or the write is over a free alpha quota (`quota-apps`, `quota-memory`, `quota-storage`, `quota-cpu`, `quota-wall`, `quota-rate`, `quota-ops`)."
+      content:
+        application/json:
+          schema:
+            oneOf:
+              - $ref: "#/components/schemas/ErrorForbidden"
+              - $ref: "#/components/schemas/ErrorHostNotYours"
+              - $ref: "#/components/schemas/ErrorModuleUploadDisabled"
+              - $ref: "#/components/schemas/ErrorQuotaApps"
+              - $ref: "#/components/schemas/ErrorQuotaMemory"
+              - $ref: "#/components/schemas/ErrorQuotaStorage"
+              - $ref: "#/components/schemas/ErrorQuotaCpu"
+              - $ref: "#/components/schemas/ErrorQuotaWall"
+              - $ref: "#/components/schemas/ErrorQuotaRate"
+              - $ref: "#/components/schemas/ErrorQuotaOps"
     Invalid:
-      description: "The request is malformed. `path` names the field."
+      description: "The request is malformed. `path` names the field when one is at fault; some refusals (a digest mismatch, a body that is not JSON) carry a message only."
       content:
         application/json:
-          schema: { $ref: "#/components/schemas/Error" }
-    Conflict:
-      description: "A conflict, with `reason` such as `route-taken`, `source-missing`, `domain-in-use`, `host-claimed` or `claim-changed`."
+          schema:
+            oneOf:
+              - $ref: "#/components/schemas/ErrorInvalid"
+              - $ref: "#/components/schemas/ErrorPlain"
+    InvalidHost:
+      description: "The hostname cannot be claimed (`reason: invalid-host`), or the body is malformed."
       content:
         application/json:
-          schema: { $ref: "#/components/schemas/Error" }
+          schema:
+            oneOf:
+              - $ref: "#/components/schemas/ErrorInvalidHost"
+              - $ref: "#/components/schemas/ErrorPlain"
+    InvalidVerify:
+      description: "The DNS proof is not there yet or could not be confirmed (`txt-missing`, `txt-unconfirmed`); `expected` is the record to publish."
+      content:
+        application/json:
+          schema:
+            oneOf:
+              - $ref: "#/components/schemas/ErrorTxtMissing"
+              - $ref: "#/components/schemas/ErrorTxtUnconfirmed"
+              - $ref: "#/components/schemas/ErrorPlain"
+    InvalidQuery:
+      description: "The request is malformed (`invalid`), a statement is refused (`refused`) or SQLite failed it (`sql-error`, with `statement`)."
+      content:
+        application/json:
+          schema:
+            oneOf:
+              - $ref: "#/components/schemas/ErrorInvalid"
+              - $ref: "#/components/schemas/ErrorRefused"
+              - $ref: "#/components/schemas/ErrorSqlError"
+              - $ref: "#/components/schemas/ErrorPlain"
+    NotFound:
+      description: "No such app, build, secret, manifest or claim in this team (another team's resource looks the same)."
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorPlain" }
+    NotFoundClaim:
+      description: "The team has no claim on this hostname (`reason: no-claim`)."
+      content:
+        application/json:
+          schema:
+            oneOf:
+              - $ref: "#/components/schemas/ErrorNoClaim"
+              - $ref: "#/components/schemas/ErrorPlain"
+    NotFoundData:
+      description: "No such app (message only), database (`no-database`), bucket (`no-bucket`) or object (`no-object`)."
+      content:
+        application/json:
+          schema:
+            oneOf:
+              - $ref: "#/components/schemas/ErrorNoDatabase"
+              - $ref: "#/components/schemas/ErrorNoBucket"
+              - $ref: "#/components/schemas/ErrorNoObject"
+              - $ref: "#/components/schemas/ErrorPlain"
+    ConflictRoutes:
+      description: "Another app holds one of the routes (`reason: route-taken`)."
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorRouteTaken" }
+    ConflictBuild:
+      description: "The source is not uploaded (`source-missing`), or another app holds a route (`route-taken`)."
+      content:
+        application/json:
+          schema:
+            oneOf:
+              - $ref: "#/components/schemas/ErrorSourceMissing"
+              - $ref: "#/components/schemas/ErrorRouteTaken"
+            discriminator:
+              propertyName: reason
+              mapping:
+                source-missing: "#/components/schemas/ErrorSourceMissing"
+                route-taken: "#/components/schemas/ErrorRouteTaken"
+    ConflictBlobs:
+      description: "Blobs the manifest names are not uploaded (`reason: blobs-missing`, `missing`, `missing_count`)."
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorBlobsMissing" }
+    ConflictDomainInUse:
+      description: "An app of the team still routes the name (`reason: domain-in-use`)."
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorDomainInUse" }
+    ConflictDomainAdd:
+      description: "Another team holds the name, verified (`reason: host-claimed`)."
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorHostClaimed" }
+    ConflictVerify:
+      description: "Another team holds the name (`host-claimed`), or the claim changed during the check (`claim-changed`)."
+      content:
+        application/json:
+          schema:
+            oneOf:
+              - $ref: "#/components/schemas/ErrorHostClaimed"
+              - $ref: "#/components/schemas/ErrorClaimChanged"
+            discriminator:
+              propertyName: reason
+              mapping:
+                host-claimed: "#/components/schemas/ErrorHostClaimed"
+                claim-changed: "#/components/schemas/ErrorClaimChanged"
+    ConflictData:
+      description: "D1: remote writes are off for this database (`capture-active`), or its file is unusable (`bad-database`)."
+      content:
+        application/json:
+          schema:
+            oneOf:
+              - $ref: "#/components/schemas/ErrorCaptureActive"
+              - $ref: "#/components/schemas/ErrorBadDatabase"
+            discriminator:
+              propertyName: reason
+              mapping:
+                capture-active: "#/components/schemas/ErrorCaptureActive"
+                bad-database: "#/components/schemas/ErrorBadDatabase"
+    LengthRequired:
+      description: "A chunked upload did not declare its length (`reason: length-required`)."
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorLengthRequired" }
     TooLarge:
-      description: "The body is over the limit for this route."
+      description: "The body is over the limit for this route (`reason: too-large`; some refusals carry a message only)."
       content:
         application/json:
-          schema: { $ref: "#/components/schemas/Error" }
-    Limited:
-      description: "Rate-limited or over a per-team cap; see *Rate limits*. Honor `Retry-After` when it is present."
+          schema:
+            oneOf:
+              - $ref: "#/components/schemas/ErrorTooLarge"
+              - $ref: "#/components/schemas/ErrorPlain"
+    TooLargeQuery:
+      description: "The request is over the limit (`too-large`) or the result is over 8 MiB (`result-too-large`)."
+      content:
+        application/json:
+          schema:
+            oneOf:
+              - $ref: "#/components/schemas/ErrorTooLarge"
+              - $ref: "#/components/schemas/ErrorResultTooLarge"
+              - $ref: "#/components/schemas/ErrorPlain"
+    Unprocessable:
+      description: "The statement needs more memory than the host allows (`reason: memory-limit`)."
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorMemoryLimit" }
+    LimitedSource:
+      description: "The key is rate-limited (`key-rate-limited`), the team uploads too fast (`upload-rate`), or it is over its 24-hour budget of new source bytes (`quota-upload`). Honor `Retry-After`."
       headers:
         Retry-After: { $ref: "#/components/headers/RetryAfter" }
       content:
         application/json:
-          schema: { $ref: "#/components/schemas/Error" }
+          schema:
+            oneOf:
+              - $ref: "#/components/schemas/ErrorKeyRateLimited"
+              - $ref: "#/components/schemas/ErrorUploadRate"
+              - $ref: "#/components/schemas/ErrorQuotaUpload"
+            discriminator:
+              propertyName: reason
+              mapping:
+                key-rate-limited: "#/components/schemas/ErrorKeyRateLimited"
+                upload-rate: "#/components/schemas/ErrorUploadRate"
+                quota-upload: "#/components/schemas/ErrorQuotaUpload"
+    LimitedBlob:
+      description: "As for sources, plus `busy` (too many large uploads in flight on this API process; retry in a few seconds). `quota-upload` counts new asset blob bytes. Honor `Retry-After`."
+      headers:
+        Retry-After: { $ref: "#/components/headers/RetryAfter" }
+      content:
+        application/json:
+          schema:
+            oneOf:
+              - $ref: "#/components/schemas/ErrorKeyRateLimited"
+              - $ref: "#/components/schemas/ErrorUploadRate"
+              - $ref: "#/components/schemas/ErrorQuotaUpload"
+              - $ref: "#/components/schemas/ErrorBusy"
+            discriminator:
+              propertyName: reason
+              mapping:
+                key-rate-limited: "#/components/schemas/ErrorKeyRateLimited"
+                upload-rate: "#/components/schemas/ErrorUploadRate"
+                quota-upload: "#/components/schemas/ErrorQuotaUpload"
+                busy: "#/components/schemas/ErrorBusy"
+    LimitedManifest:
+      description: "The key is rate-limited (`key-rate-limited`) or the team uploads too fast (`upload-rate`). Honor `Retry-After`."
+      headers:
+        Retry-After: { $ref: "#/components/headers/RetryAfter" }
+      content:
+        application/json:
+          schema:
+            oneOf:
+              - $ref: "#/components/schemas/ErrorKeyRateLimited"
+              - $ref: "#/components/schemas/ErrorUploadRate"
+            discriminator:
+              propertyName: reason
+              mapping:
+                key-rate-limited: "#/components/schemas/ErrorKeyRateLimited"
+                upload-rate: "#/components/schemas/ErrorUploadRate"
+    LimitedBuild:
+      description: "`team-queue-full` (3 builds already queued or running for the team), `team-hourly-limit` (20 builds in the last hour), `queue-full` (platform-wide queue), `quota-builds` (the free alpha builds per 24 hours) or `key-rate-limited`. Honor `Retry-After`."
+      headers:
+        Retry-After: { $ref: "#/components/headers/RetryAfter" }
+      content:
+        application/json:
+          schema:
+            oneOf:
+              - $ref: "#/components/schemas/ErrorKeyRateLimited"
+              - $ref: "#/components/schemas/ErrorTeamQueueFull"
+              - $ref: "#/components/schemas/ErrorTeamHourlyLimit"
+              - $ref: "#/components/schemas/ErrorQuotaBuilds"
+              - $ref: "#/components/schemas/ErrorQueueFull"
+            discriminator:
+              propertyName: reason
+              mapping:
+                key-rate-limited: "#/components/schemas/ErrorKeyRateLimited"
+                team-queue-full: "#/components/schemas/ErrorTeamQueueFull"
+                team-hourly-limit: "#/components/schemas/ErrorTeamHourlyLimit"
+                quota-builds: "#/components/schemas/ErrorQuotaBuilds"
+                queue-full: "#/components/schemas/ErrorQueueFull"
+    LimitedDomainAdd:
+      description: "The team holds the maximum number of domains (`domain-limit`), or the key is rate-limited (`key-rate-limited`)."
+      headers:
+        Retry-After: { $ref: "#/components/headers/RetryAfter" }
+      content:
+        application/json:
+          schema:
+            oneOf:
+              - $ref: "#/components/schemas/ErrorKeyRateLimited"
+              - $ref: "#/components/schemas/ErrorDomainLimit"
+            discriminator:
+              propertyName: reason
+              mapping:
+                key-rate-limited: "#/components/schemas/ErrorKeyRateLimited"
+                domain-limit: "#/components/schemas/ErrorDomainLimit"
+    LimitedVerify:
+      description: "One check per domain every 10 seconds (`verify-cooldown`), 20 new verifications an hour platform-wide (`verify-cap`), or `key-rate-limited`. Honor `Retry-After`."
+      headers:
+        Retry-After: { $ref: "#/components/headers/RetryAfter" }
+      content:
+        application/json:
+          schema:
+            oneOf:
+              - $ref: "#/components/schemas/ErrorKeyRateLimited"
+              - $ref: "#/components/schemas/ErrorVerifyCooldown"
+              - $ref: "#/components/schemas/ErrorVerifyCap"
+            discriminator:
+              propertyName: reason
+              mapping:
+                key-rate-limited: "#/components/schemas/ErrorKeyRateLimited"
+                verify-cooldown: "#/components/schemas/ErrorVerifyCooldown"
+                verify-cap: "#/components/schemas/ErrorVerifyCap"
+    LimitedData:
+      description: "Data routes: too many requests in flight or an empty bucket (`rate`; note `retry_after`, without `_s`), or `key-rate-limited`. Honor `Retry-After`."
+      headers:
+        Retry-After: { $ref: "#/components/headers/RetryAfter" }
+      content:
+        application/json:
+          schema:
+            oneOf:
+              - $ref: "#/components/schemas/ErrorKeyRateLimited"
+              - $ref: "#/components/schemas/ErrorRate"
+            discriminator:
+              propertyName: reason
+              mapping:
+                key-rate-limited: "#/components/schemas/ErrorKeyRateLimited"
+                rate: "#/components/schemas/ErrorRate"
+    BadGateway:
+      description: "The host agent answered something the Cloud could not handle (`reason: agent-error`)."
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorAgentError" }
+    UnavailableBuild:
+      description: "Builds are not available right now: `builds-disabled` (this Cloud does not build) or `no-builder` (none is ready; retry in a few minutes)."
+      content:
+        application/json:
+          schema:
+            oneOf:
+              - $ref: "#/components/schemas/ErrorBuildsDisabled"
+              - $ref: "#/components/schemas/ErrorNoBuilder"
+            discriminator:
+              propertyName: reason
+              mapping:
+                builds-disabled: "#/components/schemas/ErrorBuildsDisabled"
+                no-builder: "#/components/schemas/ErrorNoBuilder"
+    UnavailableAudit:
+      description: "The audit log could not record the request (`reason: audit-unavailable`); nothing was served. Retry shortly."
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorAuditUnavailable" }
+    UnavailableData:
+      description: "The app's host is not reachable (`host-unavailable`), is busy with the app's data (`busy`, `Retry-After`), or the audit log could not record the request (`audit-unavailable`). Retry shortly."
+      headers:
+        Retry-After: { $ref: "#/components/headers/RetryAfter" }
+      content:
+        application/json:
+          schema:
+            oneOf:
+              - $ref: "#/components/schemas/ErrorHostUnavailable"
+              - $ref: "#/components/schemas/ErrorBusy"
+              - $ref: "#/components/schemas/ErrorAuditUnavailable"
+            discriminator:
+              propertyName: reason
+              mapping:
+                host-unavailable: "#/components/schemas/ErrorHostUnavailable"
+                busy: "#/components/schemas/ErrorBusy"
+                audit-unavailable: "#/components/schemas/ErrorAuditUnavailable"
+    GatewayTimeout:
+      description: "The host did not answer in time (`reason: timeout`). `committed` says whether a write may have been applied."
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorTimeout" }
+    InsufficientStorage:
+      description: "The app's storage quota on its host is full (`reason: quota-exceeded`)."
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorQuotaExceeded" }
   schemas:
     Error:
       type: object
@@ -1313,6 +1735,420 @@ components:
         path: { type: string, description: "The request field at fault." }
         need: { type: string, description: "The grant a 403 asks for, `app:write` for example." }
         retry_after_s: { type: integer }
+    ErrorInvalid:
+      description: "A field is malformed, unknown or out of range. `path` names it when one field is at fault."
+      type: object
+      required: [error, reason]
+      properties:
+        error: { type: string, description: "A message for people. Do not parse it." }
+        reason: { type: string, const: invalid, enum: [invalid] }
+    ErrorInvalidHost:
+      description: "The hostname is not one a team can claim as a custom domain (wildcards, platform names and malformed names are refused). `path` is `host`."
+      type: object
+      required: [error, reason]
+      properties:
+        error: { type: string, description: "A message for people. Do not parse it." }
+        reason: { type: string, const: invalid-host, enum: [invalid-host] }
+    ErrorTxtMissing:
+      description: "Verification: neither resolver sees the TXT record yet. `expected` is the record to publish."
+      type: object
+      required: [error, reason, expected, detail]
+      properties:
+        error: { type: string, description: "A message for people. Do not parse it." }
+        reason: { type: string, const: txt-missing, enum: [txt-missing] }
+        expected: { $ref: "#/components/schemas/DnsTxtRecord" }
+        detail: { type: string, description: "What the resolvers answered." }
+    ErrorTxtUnconfirmed:
+      description: "Verification: the lookup could not be confirmed (a resolver failed or the two disagree). Try again after the cooldown."
+      type: object
+      required: [error, reason, expected, detail]
+      properties:
+        error: { type: string, description: "A message for people. Do not parse it." }
+        reason: { type: string, const: txt-unconfirmed, enum: [txt-unconfirmed] }
+        expected: { $ref: "#/components/schemas/DnsTxtRecord" }
+        detail: { type: string, description: "What went wrong." }
+    ErrorRefused:
+      description: "D1: the statement is refused (the first-filter guard, or SQLite refused it); `error` says why."
+      type: object
+      required: [error, reason]
+      properties:
+        error: { type: string, description: "A message for people. Do not parse it." }
+        reason: { type: string, const: refused, enum: [refused] }
+    ErrorSqlError:
+      description: "D1: SQLite failed the statement. `statement` is the zero-based index of the failing statement when there is one."
+      type: object
+      required: [error, reason]
+      properties:
+        error: { type: string, description: "A message for people. Do not parse it." }
+        reason: { type: string, const: sql-error, enum: [sql-error] }
+        statement: { type: integer, minimum: 0, description: "The index of the failing statement in `statements`." }
+    ErrorForbidden:
+      description: "The key lacks a grant, or may not do this (a key with only `app:delete_own` deleting an app it did not create). `need` is the grant to ask for."
+      type: object
+      required: [error, reason, need]
+      properties:
+        error: { type: string, description: "A message for people. Do not parse it." }
+        reason: { type: string, const: forbidden, enum: [forbidden] }
+        need: { type: string, description: "The grant, as `<resource>:<action>`, for example `app:write`.", examples: ["app:write"] }
+    ErrorHostNotYours:
+      description: "A route the team may not use: it is neither `<name>.<team slug>.sproutboat.app` nor a custom domain the team has verified. `path` is `hosts`."
+      type: object
+      required: [error, reason, path]
+      properties:
+        error: { type: string, description: "A message for people. Do not parse it." }
+        reason: { type: string, const: host-not-yours, enum: [host-not-yours] }
+        path: { type: string, const: hosts, enum: [hosts] }
+    ErrorQuotaApps:
+      description: "Free alpha quota: the team already has its maximum number of apps. Delete one, or ask for more."
+      type: object
+      required: [error, reason, limit, used]
+      properties:
+        error: { type: string, description: "A message for people. Do not parse it." }
+        reason: { type: string, const: quota-apps, enum: [quota-apps] }
+        limit: { type: integer, description: "Apps allowed." }
+        used: { type: integer, description: "Apps the team has." }
+    ErrorQuotaMemory:
+      description: "Free alpha quota: `limits.memory_mb` is over the ceiling per app. The write is refused, never clamped."
+      type: object
+      required: [error, reason, limit, asked]
+      properties:
+        error: { type: string, description: "A message for people. Do not parse it." }
+        reason: { type: string, const: quota-memory, enum: [quota-memory] }
+        limit: { type: integer, description: "The ceiling, in MiB." }
+        asked: { type: integer, description: "What the spec asked for." }
+    ErrorQuotaStorage:
+      description: "Free alpha quota: `limits.storage_mb` is over the ceiling (`asked` is set), or the team's static assets would not fit its storage (`would_use_mb` is set)."
+      type: object
+      required: [error, reason, limit]
+      properties:
+        error: { type: string, description: "A message for people. Do not parse it." }
+        reason: { type: string, const: quota-storage, enum: [quota-storage] }
+        limit: { type: integer, description: "The ceiling, in MiB." }
+        asked: { type: integer, description: "What `limits.storage_mb` asked for." }
+        would_use_mb: { type: integer, description: "The static assets of the team's apps with this deploy, in MiB." }
+    ErrorQuotaCpu:
+      description: "Free alpha quota: `limits.cpu_ms` is over the ceiling. The write is refused, never clamped."
+      type: object
+      required: [error, reason, limit, asked]
+      properties:
+        error: { type: string, description: "A message for people. Do not parse it." }
+        reason: { type: string, const: quota-cpu, enum: [quota-cpu] }
+        limit: { type: integer, description: "The ceiling, in milliseconds of CPU per request." }
+        asked: { type: integer }
+    ErrorQuotaWall:
+      description: "Free alpha quota: `limits.wall_ms` is over the ceiling. The write is refused, never clamped."
+      type: object
+      required: [error, reason, limit, asked]
+      properties:
+        error: { type: string, description: "A message for people. Do not parse it." }
+        reason: { type: string, const: quota-wall, enum: [quota-wall] }
+        limit: { type: integer, description: "The ceiling, in milliseconds of wall time per request." }
+        asked: { type: integer }
+    ErrorQuotaRate:
+      description: "Free alpha quota: `limits.rate_rps` (or `rate_burst`) is over the ceiling, or `rate_rps: 0` (no limit) was asked for. The request rate limit cannot be lifted."
+      type: object
+      required: [error, reason, limit, asked]
+      properties:
+        error: { type: string, description: "A message for people. Do not parse it." }
+        reason: { type: string, const: quota-rate, enum: [quota-rate] }
+        limit: { type: integer, description: "The ceiling." }
+        asked: { type: integer }
+    ErrorQuotaOps:
+      description: "Free alpha quota: `limits.ops_per_sec` is over the ceiling. The write is refused, never clamped."
+      type: object
+      required: [error, reason, limit, asked]
+      properties:
+        error: { type: string, description: "A message for people. Do not parse it." }
+        reason: { type: string, const: quota-ops, enum: [quota-ops] }
+        limit: { type: integer, description: "The ceiling, in binding operations per second." }
+        asked: { type: integer }
+    ErrorNoClaim:
+      description: "The team has no claim on this hostname."
+      type: object
+      required: [error, reason]
+      properties:
+        error: { type: string, description: "A message for people. Do not parse it." }
+        reason: { type: string, const: no-claim, enum: [no-claim] }
+    ErrorNoDatabase:
+      description: "The app has no such D1 database (yet)."
+      type: object
+      required: [error, reason]
+      properties:
+        error: { type: string, description: "A message for people. Do not parse it." }
+        reason: { type: string, const: no-database, enum: [no-database] }
+    ErrorNoBucket:
+      description: "The app has no such R2 bucket binding."
+      type: object
+      required: [error, reason]
+      properties:
+        error: { type: string, description: "A message for people. Do not parse it." }
+        reason: { type: string, const: no-bucket, enum: [no-bucket] }
+    ErrorNoObject:
+      description: "No object under this key."
+      type: object
+      required: [error, reason]
+      properties:
+        error: { type: string, description: "A message for people. Do not parse it." }
+        reason: { type: string, const: no-object, enum: [no-object] }
+    ErrorRouteTaken:
+      description: "Another app already holds one of the routes. `path` is `hosts`."
+      type: object
+      required: [error, reason, path]
+      properties:
+        error: { type: string, description: "A message for people. Do not parse it." }
+        reason: { type: string, const: route-taken, enum: [route-taken] }
+        path: { type: string, const: hosts, enum: [hosts] }
+    ErrorSourceMissing:
+      description: "The build names a `source_sha256` this team has not uploaded (a source another team holds does not count). Upload it with `PUT /v1/sources/{sha256}`, then start the build again."
+      type: object
+      required: [error, reason]
+      properties:
+        error: { type: string, description: "A message for people. Do not parse it." }
+        reason: { type: string, const: source-missing, enum: [source-missing] }
+    ErrorBlobsMissing:
+      description: "The manifest names blobs this team has not uploaded. Upload them with `PUT /v1/assets/blobs/{sha256}`, then the manifest again."
+      type: object
+      required: [error, reason, missing, missing_count]
+      properties:
+        error: { type: string, description: "A message for people. Do not parse it." }
+        reason: { type: string, const: blobs-missing, enum: [blobs-missing] }
+        missing: { type: array, maxItems: 100, items: { $ref: "#/components/schemas/Sha256" }, description: "Up to 100 of the missing digests." }
+        missing_count: { type: integer, description: "How many are missing in all." }
+    ErrorDomainInUse:
+      description: "An app of the team still routes this hostname. Remove those routes (`PATCH /v1/apps/{project}/routes`) first."
+      type: object
+      required: [error, reason]
+      properties:
+        error: { type: string, description: "A message for people. Do not parse it." }
+        reason: { type: string, const: domain-in-use, enum: [domain-in-use] }
+    ErrorHostClaimed:
+      description: "Another team holds this name, verified. If it removes its DNS record the name can be claimed here; your claim stays pending."
+      type: object
+      required: [error, reason]
+      properties:
+        error: { type: string, description: "A message for people. Do not parse it." }
+        reason: { type: string, const: host-claimed, enum: [host-claimed] }
+    ErrorClaimChanged:
+      description: "The claim changed while it was being checked. Try again."
+      type: object
+      required: [error, reason]
+      properties:
+        error: { type: string, description: "A message for people. Do not parse it." }
+        reason: { type: string, const: claim-changed, enum: [claim-changed] }
+    ErrorCaptureActive:
+      description: "D1: remote writes are not available for a database with backup capture on; write through the app."
+      type: object
+      required: [error, reason]
+      properties:
+        error: { type: string, description: "A message for people. Do not parse it." }
+        reason: { type: string, const: capture-active, enum: [capture-active] }
+    ErrorBadDatabase:
+      description: "D1: the app's database file on the host is not a usable SQLite database."
+      type: object
+      required: [error, reason]
+      properties:
+        error: { type: string, description: "A message for people. Do not parse it." }
+        reason: { type: string, const: bad-database, enum: [bad-database] }
+    ErrorLengthRequired:
+      description: "R2: a chunked upload must declare its length with `Content-Length` or `X-Declared-Length`."
+      type: object
+      required: [error, reason]
+      properties:
+        error: { type: string, description: "A message for people. Do not parse it." }
+        reason: { type: string, const: length-required, enum: [length-required] }
+    ErrorTooLarge:
+      description: "The body is over the limit for this route (JSON bodies 256 KiB, or 1 MiB for specs, builds, secrets and route edits; 5 MiB for `POST /v1/assets/missing`; 4 MiB for D1 SQL; blobs and R2 objects 64 MiB; sources 8 MiB; manifests 4 MiB). Counted as the body streams in, so a chunked body is refused too."
+      type: object
+      required: [error, reason]
+      properties:
+        error: { type: string, description: "A message for people. Do not parse it." }
+        reason: { type: string, const: too-large, enum: [too-large] }
+    ErrorResultTooLarge:
+      description: "D1: the result is larger than 8 MiB. Select fewer rows or columns."
+      type: object
+      required: [error, reason]
+      properties:
+        error: { type: string, description: "A message for people. Do not parse it." }
+        reason: { type: string, const: result-too-large, enum: [result-too-large] }
+    ErrorMemoryLimit:
+      description: "D1: the statement needs more memory than the host allows."
+      type: object
+      required: [error, reason]
+      properties:
+        error: { type: string, description: "A message for people. Do not parse it." }
+        reason: { type: string, const: memory-limit, enum: [memory-limit] }
+    ErrorKeyRateLimited:
+      description: "The key is over 600 requests a minute."
+      type: object
+      required: [error, reason, retry_after_s]
+      properties:
+        error: { type: string, description: "A message for people. Do not parse it." }
+        reason: { type: string, const: key-rate-limited, enum: [key-rate-limited] }
+        retry_after_s: { type: integer, description: "Seconds to wait; also the `Retry-After` header." }
+    ErrorRate:
+      description: "Data routes: the team has too many requests in flight or an empty bucket. Note the field name: `retry_after`, without `_s`."
+      type: object
+      required: [error, reason, retry_after]
+      properties:
+        error: { type: string, description: "A message for people. Do not parse it." }
+        reason: { type: string, const: rate, enum: [rate] }
+        retry_after: { type: integer, description: "Seconds to wait; also the `Retry-After` header." }
+    ErrorQuotaBuilds:
+      description: "Free alpha quota: builds that compile in a rolling 24 hours. Cached builds are free."
+      type: object
+      required: [error, reason, limit, used, retry_after_s]
+      properties:
+        error: { type: string, description: "A message for people. Do not parse it." }
+        reason: { type: string, const: quota-builds, enum: [quota-builds] }
+        limit: { type: integer }
+        used: { type: integer }
+        retry_after_s: { type: integer, description: "Until the next slot opens; also the `Retry-After` header." }
+    ErrorTeamQueueFull:
+      description: "The team already has 3 builds queued or running. Wait for one to finish."
+      type: object
+      required: [error, reason]
+      properties:
+        error: { type: string, description: "A message for people. Do not parse it." }
+        reason: { type: string, const: team-queue-full, enum: [team-queue-full] }
+    ErrorTeamHourlyLimit:
+      description: "The team started 20 builds (not cached) in the last hour."
+      type: object
+      required: [error, reason]
+      properties:
+        error: { type: string, description: "A message for people. Do not parse it." }
+        reason: { type: string, const: team-hourly-limit, enum: [team-hourly-limit] }
+    ErrorQueueFull:
+      description: "The platform-wide build queue is full."
+      type: object
+      required: [error, reason, queue_length, drain_s, retry_after_s]
+      properties:
+        error: { type: string, description: "A message for people. Do not parse it." }
+        reason: { type: string, const: queue-full, enum: [queue-full] }
+        queue_length: { type: integer }
+        drain_s: { type: integer, description: "About how long the queue's work takes." }
+        retry_after_s: { type: integer, description: "About when a slot frees; also the `Retry-After` header." }
+    ErrorQuotaUpload:
+      description: "Free alpha quota: bytes of new sources or new asset blobs the team may upload in a rolling 24 hours. Bytes the team already uploaded cost nothing."
+      type: object
+      required: [error, reason, key, limit, used_mb, retry_after_s]
+      properties:
+        error: { type: string, description: "A message for people. Do not parse it." }
+        reason: { type: string, const: quota-upload, enum: [quota-upload] }
+        key: { type: string, enum: [source_mb_per_day, asset_mb_per_day], description: "Which budget." }
+        limit: { type: integer, description: "MiB per 24 hours." }
+        used_mb: { type: integer, description: "MiB uploaded in the last 24 hours." }
+        retry_after_s: { type: integer, description: "Also the `Retry-After` header." }
+    ErrorUploadRate:
+      description: "Too many uploads from this team a minute (per team, not per key). Note the field name: `retry_after`, without `_s`."
+      type: object
+      required: [error, reason, retry_after]
+      properties:
+        error: { type: string, description: "A message for people. Do not parse it." }
+        reason: { type: string, const: upload-rate, enum: [upload-rate] }
+        retry_after: { type: integer, description: "Seconds to wait; also the `Retry-After` header." }
+    ErrorBusy:
+      description: "Uploads: too many large uploads in flight at once on this API process (429), or the host is busy with the app's data (503). Retry shortly."
+      type: object
+      required: [error, reason, retry_after]
+      properties:
+        error: { type: string, description: "A message for people. Do not parse it." }
+        reason: { type: string, const: busy, enum: [busy] }
+        retry_after: { type: integer, description: "Seconds to wait; also the `Retry-After` header." }
+    ErrorDomainLimit:
+      description: "The team holds the maximum number of custom domains (10). Release one first."
+      type: object
+      required: [error, reason]
+      properties:
+        error: { type: string, description: "A message for people. Do not parse it." }
+        reason: { type: string, const: domain-limit, enum: [domain-limit] }
+    ErrorVerifyCooldown:
+      description: "One check per domain every 10 seconds."
+      type: object
+      required: [error, reason, retry_after_s]
+      properties:
+        error: { type: string, description: "A message for people. Do not parse it." }
+        reason: { type: string, const: verify-cooldown, enum: [verify-cooldown] }
+        retry_after_s: { type: integer }
+    ErrorVerifyCap:
+      description: "The platform verifies at most 20 new domains an hour."
+      type: object
+      required: [error, reason, retry_after_s]
+      properties:
+        error: { type: string, description: "A message for people. Do not parse it." }
+        reason: { type: string, const: verify-cap, enum: [verify-cap] }
+        retry_after_s: { type: integer }
+    ErrorAgentError:
+      description: "The host agent answered something the Cloud could not handle. Retry; report it if it persists."
+      type: object
+      required: [error, reason]
+      properties:
+        error: { type: string, description: "A message for people. Do not parse it." }
+        reason: { type: string, const: agent-error, enum: [agent-error] }
+    ErrorHostUnavailable:
+      description: "The host that holds the app is not reachable or not ready right now. Retry in a few minutes."
+      type: object
+      required: [error, reason]
+      properties:
+        error: { type: string, description: "A message for people. Do not parse it." }
+        reason: { type: string, const: host-unavailable, enum: [host-unavailable] }
+    ErrorAuditUnavailable:
+      description: "The audit log could not record the request, so nothing was served. Retry shortly."
+      type: object
+      required: [error, reason]
+      properties:
+        error: { type: string, description: "A message for people. Do not parse it." }
+        reason: { type: string, const: audit-unavailable, enum: [audit-unavailable] }
+    ErrorBuildsDisabled:
+      description: "This Cloud does not build."
+      type: object
+      required: [error, reason]
+      properties:
+        error: { type: string, description: "A message for people. Do not parse it." }
+        reason: { type: string, const: builds-disabled, enum: [builds-disabled] }
+    ErrorNoBuilder:
+      description: "No builder is ready. Retry in a few minutes."
+      type: object
+      required: [error, reason]
+      properties:
+        error: { type: string, description: "A message for people. Do not parse it." }
+        reason: { type: string, const: no-builder, enum: [no-builder] }
+    ErrorTimeout:
+      description: "The host did not answer in time. `committed` says whether a write may have been applied: `no` (the host timed out inside a transaction), or `unknown` (the Cloud's own timeout, or a D1 request without a transaction). Check before retrying a write."
+      type: object
+      required: [error, reason, committed]
+      properties:
+        error: { type: string, description: "A message for people. Do not parse it." }
+        reason: { type: string, const: timeout, enum: [timeout] }
+        committed: { type: string, enum: ["no", unknown] }
+    ErrorQuotaExceeded:
+      description: "The app's storage quota on its host is full."
+      type: object
+      required: [error, reason]
+      properties:
+        error: { type: string, description: "A message for people. Do not parse it." }
+        reason: { type: string, const: quota-exceeded, enum: [quota-exceeded] }
+    ErrorPlain:
+      description: "An error without a `reason`: a message only (a missing app or build, a digest mismatch, a body that is not JSON, a wrong method, an unexpected failure)."
+      allOf:
+        - $ref: "#/components/schemas/Error"
+      not:
+        required: [reason]
+        properties:
+          reason: {}
+    ErrorModuleUploadDisabled:
+      description: "403 from `PUT /v1/apps/{project}`: the module is neither the one the app runs nor one your team's builds produced. The one error without a `reason`: the machine-readable name is in `error`."
+      type: object
+      required: [error, message]
+      properties:
+        error: { type: string, const: module-upload-disabled, enum: [module-upload-disabled] }
+        message: { type: string }
+    DnsTxtRecord:
+      type: object
+      required: [type, name, value]
+      properties:
+        type: { type: string, const: TXT }
+        name: { type: string, examples: ["_sproutboat-challenge.app.example.com"] }
+        value: { type: string, examples: ["sproutboat-verify=..."] }
     Sha256:
       type: string
       pattern: "^[0-9a-f]{64}$"
@@ -1349,7 +2185,8 @@ components:
       properties:
         set:
           type: object
-          additionalProperties: { type: string }
+          description: "Secret name to value. The values are secrets: never returned by any route, keep them out of logs."
+          additionalProperties: { type: string, format: password, writeOnly: true, x-sensitive: true }
         delete:
           type: array
           items: { type: string }
@@ -1419,7 +2256,7 @@ components:
     Limits:
       type: object
       additionalProperties: false
-      description: "Per-app ceilings. A null or absent value means the platform default. A plan may cap them lower."
+      description: "Per-app ceilings. A null or absent value means the platform default. The account's own ceilings (`GET /v1/limits`) cap what a team may ask for here: a value over one is refused with 403 `quota-*` (never clamped), and `rate_rps: 0` (no limit) is refused too."
       properties:
         memory_mb: { type: [integer, "null"], minimum: 8, maximum: 4096 }
         cpu_ms: { type: [integer, "null"], minimum: 10, maximum: 600000 }
@@ -1472,7 +2309,8 @@ components:
               description: "Absent keeps the stored secrets, null clears them, an object replaces the set. Needs `secret:write`."
               oneOf:
                 - type: object
-                  additionalProperties: { type: string }
+                  description: "Secret name to value. The values are secrets: never returned by any route, keep them out of logs."
+                  additionalProperties: { type: string, format: password, writeOnly: true, x-sensitive: true }
                 - type: "null"
             secrets_patch:
               $ref: "#/components/schemas/SecretsPatch"
