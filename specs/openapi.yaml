@@ -6,7 +6,7 @@ info:
   description: |
     Everything an integration needs to deploy and run an app on Sproutboat Cloud without the CLI: create and delete
     apps, upload a source bundle and static assets by sha256, start and follow a build, wait until a generation is
-    live, set secrets, edit routes and custom domains, read build logs and app metrics.
+    live, set secrets, edit routes and custom domains, read build logs, app metrics and a running app's logs.
 
     This is a **draft**. It describes what the code does today, and it is checked against the Cloud's routes whenever a
     route is added or removed. Statements
@@ -36,6 +36,7 @@ info:
     | `secret:list` | read secret *names* |
     | `secret:write` | set and delete secrets |
     | `data:read` / `data:write` | read / change an app's D1 and R2 data |
+    | `logs:read` | read a running app's logs: the recent lines and the live stream |
     | `domain:read` / `domain:write` | read / add, verify and remove custom domains |
 
     ## Servers
@@ -119,9 +120,10 @@ info:
     ## What is not in this file
 
     Git push-to-deploy (`/v1/git/*`, `/v1/apps/{project}/git*`), the browser sign-in flows, and team and key management
-    are not part of this file. There is **no route for a running app's stdout logs**:
-    build logs stream over `GET /v1/builds/{id}/events`, and `GET /v1/apps/{project}/events` returns only the last
-    exceptions and triggers. There is no rollback route either; see *Deploy flow* for how a previous version is redeployed.
+    are not part of this file. A running app's own output is read through
+    `GET /v1/apps/{project}/logs` (recent lines) and `GET /v1/apps/{project}/tail` (live); build logs stream over
+    `GET /v1/builds/{id}/events`, and `GET /v1/apps/{project}/events` returns only the last exceptions and triggers (a
+    counter ring, not a log). There is no rollback route either; see *Deploy flow* for how a previous version is redeployed.
 
     ## Deploy flow
 
@@ -1219,6 +1221,126 @@ paths:
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
         "429": { $ref: "#/components/responses/KeyRateLimited" }
+  /v1/apps/{project}/logs:
+    parameters:
+      - $ref: "#/components/parameters/project"
+    get:
+      operationId: getAppLogs
+      tags: [Observability]
+      summary: "Recent log lines of a running app"
+      description: |
+        The last lines of what the app printed (`console.log`, `console.error`, uncaught errors) and of the host's own lines about it
+        (a request line per request, a worker that stopped), oldest first, as plain text lines. The control plane stores none of it: the
+        lines come from the app's host, which keeps up to about 16 MiB or 7 days of output per app (`retention` in the answer).
+        Lines have **no timestamp and no level** here (the host does not record them); the live stream has times.
+
+        What is removed before a line is returned: the query string of every request URL in the host's request lines, and every value
+        of the app's secrets of 8 characters or more (also URL-encoded, JSON-escaped, base64 and hex), replaced by `[redacted]`.
+        Redaction is best effort: a secret the app slices, hashes or re-encodes is not matched, and a value shorter than 8 characters
+        never is. A line over 16 KiB is cut with an ellipsis.
+      x-sproutboat-permission: "logs:read"
+      parameters:
+        - name: lines
+          in: query
+          description: "How many of the last lines, 1 to 1000. Default 100."
+          schema: { type: integer, minimum: 1, maximum: 1000, default: 100 }
+      responses:
+        "200":
+          description: "The lines."
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [project, lines, retention]
+                properties:
+                  project: { type: string }
+                  lines: { type: array, items: { type: string } }
+                  retention: { type: string, description: "How long the host keeps the app's output, in words." }
+        "400": { $ref: "#/components/responses/Invalid" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/LimitedData" }
+        "502": { $ref: "#/components/responses/BadGateway" }
+        "503": { $ref: "#/components/responses/UnavailableLogs" }
+  /v1/apps/{project}/tail:
+    parameters:
+      - $ref: "#/components/parameters/project"
+    get:
+      operationId: tailApp
+      tags: [Observability]
+      summary: "Stream a running app's events live"
+      description: |
+        `text/event-stream`, the frames `sproutboat tail` reads. Each `data:` line is one JSON object with a `type`:
+
+        - `ready`, once, first.
+        - `event`, with an `event` object shaped like a `wrangler tail` event: `scriptName`, `outcome` (`ok`, `exception`, `exceededCpu`,
+          `exceededWallTime`, `canceled`, `rateLimited`, ...), `eventTimestamp` (ms), `event` (`{request: {url, method}, response: {status}}`
+          for a request, `null` otherwise), `cpuTime` (always `null`), `wallTime` (ms), `logs` (`[{level, message: [string], timestamp}]`) and
+          `exceptions` (`[{name, message, timestamp, stack?}]`). A request, a console line and an error are **separate events**: the host
+          cannot tell which request printed a line, so lines are not grouped under their request, and their `level` is always `log`.
+          `url` is the full request URL **without its query string**.
+        - `dropped`, with `count` (events) or `bytes`, and `reason` (`rate`: over 100 events a second after the filters; `backlog`: the client
+          or the host fell behind and output was skipped).
+        - `closed`, with a `reason` (`time`: the session cap; `host`: the host closed its side; `gone`: the app was deleted). The stream then
+          ends. A client reconnects.
+
+        A `: keepalive` comment arrives every 15 seconds. A session lasts at most 10 minutes; reconnect after `closed`. Events are live only:
+        nothing is replayed (use `GET /v1/apps/{project}/logs` for what was printed before). Limits: 5 live viewers per app, 10 per team,
+        and a bounded number per host (a 429 `tail-viewers` says which `scope`). Secret values of 8 characters or more are removed as in
+        `GET /v1/apps/{project}/logs`.
+
+        The `status`, `method`, `outcome` and `sampling-rate` filters apply to request events; console lines and errors always pass them, so
+        the lines of a failing request are not hidden. `search` applies to every event.
+      x-sproutboat-permission: "logs:read"
+      parameters:
+        - name: status
+          in: query
+          description: "`ok` (the outcome was ok), `error` (any other outcome but `canceled`), a code such as `404`, or a class such as `5xx`. Repeat the parameter or comma-separate."
+          schema: { type: array, items: { type: string } }
+          style: form
+          explode: true
+        - name: method
+          in: query
+          description: "HTTP methods, repeated or comma-separated."
+          schema: { type: array, items: { type: string } }
+          style: form
+          explode: true
+        - name: outcome
+          in: query
+          description: "Outcome names, repeated or comma-separated."
+          schema: { type: array, items: { type: string } }
+          style: form
+          explode: true
+        - name: sampling-rate
+          in: query
+          description: "Send only this fraction of request events, 0 to 1."
+          schema: { type: number, minimum: 0, maximum: 1 }
+        - name: search
+          in: query
+          description: "A text a message, URL or exception must contain (case-sensitive, at most 200 characters)."
+          schema: { type: string, maxLength: 200 }
+      responses:
+        "200":
+          description: "The event stream."
+          content:
+            text/event-stream:
+              schema:
+                type: string
+                examples:
+                  - |
+                    data: {"type":"ready"}
+
+                    data: {"type":"event","event":{"scriptName":"blog","outcome":"ok","eventTimestamp":1795452909449,"event":{"request":{"url":"http://blog.acme.sproutboat.app/log","method":"GET"},"response":{"status":200}},"cpuTime":null,"wallTime":12.3,"logs":[],"exceptions":[]}}
+
+                    data: {"type":"event","event":{"scriptName":"blog","outcome":"ok","eventTimestamp":1795452909448,"event":null,"cpuTime":null,"wallTime":0,"logs":[{"level":"log","message":["hello from the log route"],"timestamp":1795452909448}],"exceptions":[]}}
+        "400": { $ref: "#/components/responses/Invalid" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/LimitedTail" }
+        "502": { $ref: "#/components/responses/BadGateway" }
+        "503": { $ref: "#/components/responses/UnavailableLogs" }
   /v1/notices:
     get:
       operationId: listNotices
@@ -1714,6 +1836,36 @@ components:
                 host-unavailable: "#/components/schemas/ErrorHostUnavailable"
                 busy: "#/components/schemas/ErrorBusy"
                 audit-unavailable: "#/components/schemas/ErrorAuditUnavailable"
+    UnavailableLogs:
+      description: "The app's host is not reachable (`host-unavailable`), the app is not running on it yet (`app-not-ready`), or the audit log could not record the request (`audit-unavailable`). Retry shortly."
+      content:
+        application/json:
+          schema:
+            oneOf:
+              - $ref: "#/components/schemas/ErrorHostUnavailable"
+              - $ref: "#/components/schemas/ErrorAppNotReady"
+              - $ref: "#/components/schemas/ErrorAuditUnavailable"
+            discriminator:
+              propertyName: reason
+              mapping:
+                host-unavailable: "#/components/schemas/ErrorHostUnavailable"
+                app-not-ready: "#/components/schemas/ErrorAppNotReady"
+                audit-unavailable: "#/components/schemas/ErrorAuditUnavailable"
+    LimitedTail:
+      description: "Too many live tails (`tail-viewers`, with the `scope` that is full and `Retry-After`), or `key-rate-limited`."
+      headers:
+        Retry-After: { $ref: "#/components/headers/RetryAfter" }
+      content:
+        application/json:
+          schema:
+            oneOf:
+              - $ref: "#/components/schemas/ErrorKeyRateLimited"
+              - $ref: "#/components/schemas/ErrorTailViewers"
+            discriminator:
+              propertyName: reason
+              mapping:
+                key-rate-limited: "#/components/schemas/ErrorKeyRateLimited"
+                tail-viewers: "#/components/schemas/ErrorTailViewers"
     GatewayTimeout:
       description: "The host did not answer in time (`reason: timeout`). `committed` says whether a write may have been applied."
       content:
@@ -2084,6 +2236,22 @@ components:
       properties:
         error: { type: string, description: "A message for people. Do not parse it." }
         reason: { type: string, const: agent-error, enum: [agent-error] }
+    ErrorTailViewers:
+      description: "Too many live tails: 5 per app, 10 per team, a bounded number per host and per API process. Close one, or retry after `retry_after` seconds."
+      type: object
+      required: [error, reason, scope, retry_after]
+      properties:
+        error: { type: string, description: "A message for people. Do not parse it." }
+        reason: { type: string, const: tail-viewers, enum: [tail-viewers] }
+        scope: { type: string, enum: [app, team, host, process], description: "Which limit is full." }
+        retry_after: { type: integer, description: "Seconds to wait; also the `Retry-After` header." }
+    ErrorAppNotReady:
+      description: "The app exists but its host is not running it yet (a deploy that has not been applied). Retry in a few minutes."
+      type: object
+      required: [error, reason]
+      properties:
+        error: { type: string, description: "A message for people. Do not parse it." }
+        reason: { type: string, const: app-not-ready, enum: [app-not-ready] }
     ErrorHostUnavailable:
       description: "The host that holds the app is not reachable or not ready right now. Retry in a few minutes."
       type: object
