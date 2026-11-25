@@ -86,8 +86,10 @@ info:
 
     ## Rate limits
 
-    - **Per key:** 600 requests a minute. Over it: 429, `reason: key-rate-limited`, `retry_after_s`, and a
-      `Retry-After` header.
+    - **Per key:** 2,000 requests a minute for a key that holds `app:write` (a deploy sends one request per missing asset
+      file, plus the polls of the rollout), 600 for a key that cannot write. Over it: 429, `reason: key-rate-limited`,
+      `retry_after_s`, and a `Retry-After` header; wait that long and send the same request again. Keys made before
+      2026-11-25 that could deploy were raised to 2,000 as well.
     - **Data routes** (D1 query, R2 objects): per team, 2 requests in flight and a bucket of 60 refilled at 10 a second.
       Over it: 429, `reason: rate`, `retry_after`, `Retry-After` header. Counted per API process, so treat them as approximate.
     - **Uploads** (`PUT /v1/sources/...`, `PUT /v1/assets/blobs/...`, `PUT /v1/assets/manifests/...`): per team, not per key.
@@ -121,7 +123,8 @@ info:
 
     Git push-to-deploy (`/v1/git/*`, `/v1/apps/{project}/git*`), the browser sign-in flows, and team and key management
     are not part of this file. A running app's own output is read through
-    `GET /v1/apps/{project}/logs` (recent lines) and `GET /v1/apps/{project}/tail` (live); build logs stream over
+    `GET /v1/apps/{project}/logs` (recent lines) and `GET /v1/apps/{project}/tail` (live), or grouped one run per request through
+    `GET /v1/apps/{project}/invocations` and `.../invocations/tail`; build logs stream over
     `GET /v1/builds/{id}/events`, and `GET /v1/apps/{project}/events` returns only the last exceptions and triggers (a
     counter ring, not a log). There is no rollback route either; see *Deploy flow* for how a previous version is redeployed.
 
@@ -707,7 +710,9 @@ paths:
       tags: [Secrets]
       summary: "Patch secrets"
       description: |
-        Deletes first, then sets, in one write that bumps `record_generation`. Deleting a name that is not there is not an error here. Names match `[A-Za-z_][A-Za-z0-9_]*`, at
+        Deletes first, then sets, in one write that bumps `record_generation`. Deleting a name that is not there is not an error here.
+        A name you set that the app's `bindings` do not declare as a `secret` is stored, but the Worker's `env` does not carry it: the answer lists it in `warnings`
+        (`code: secret-not-declared`, with the `fix`) and the status is still 200. Declare it in the deploy's `bindings` and the value goes live with that deploy. Names match `[A-Za-z_][A-Za-z0-9_]*`, at
         most 128 characters; at most 128 secrets per app and 64 KiB of values in total. Values are strings.
       x-sproutboat-permission: "secret:write"
       requestBody:
@@ -722,11 +727,12 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [app_id, record_generation, names]
+                required: [app_id, record_generation, names, warnings]
                 properties:
                   app_id: { type: string }
                   record_generation: { type: integer }
                   names: { type: array, items: { type: string } }
+                  warnings: { $ref: "#/components/schemas/SecretWarnings" }
         "400": { $ref: "#/components/responses/Invalid" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
@@ -744,7 +750,7 @@ paths:
       operationId: putSecret
       tags: [Secrets]
       summary: "Set one secret"
-      description: "The app must exist (404 otherwise). Bumps `record_generation` even if the value is unchanged."
+      description: "The app must exist (404 otherwise). Bumps `record_generation` even if the value is unchanged. A name the app does not declare as a `secret` binding is stored, with a `secret-not-declared` entry in `warnings` and the line that fixes it: the Worker's `env` is built from the declared bindings, so it does not see the value until a deploy declares the name (Wrangler needs no declaration; here it is a warning, not a refusal, so a secret may be set before the deploy that declares it)."
       x-sproutboat-permission: "secret:write"
       requestBody:
         required: true
@@ -1155,7 +1161,9 @@ paths:
       description: |
         Aggregates over a range: request counts by status class, outcomes, latency histograms, wakes, CPU and memory.
         One-minute points are kept 7 days, hourly points longer (`retention` in the answer says how long).
-        **Uncertain:** the point and total fields are large and still change; this file documents the envelope only.
+        `totals.request_cpu` and each point's `request_cpu` (`{hist, p50_ms, p95_ms, p99_ms, sum_ms}`) are the CPU time of each request the runtime stamped one on, in the
+        buckets of `duration_bounds_ms`; they are absent where no request reported a CPU time (a host from before logs step 2, a quiet minute).
+        The per-bucket arrays have a fixed order (listed on each field); a new entry is only ever added at the end, so read them by position and ignore a longer array.
       x-sproutboat-permission: "app:read"
       parameters:
         - name: range
@@ -1166,16 +1174,7 @@ paths:
           description: "The metrics."
           content:
             application/json:
-              schema:
-                type: object
-                additionalProperties: true
-                properties:
-                  range: { type: string }
-                  step_seconds: { type: integer }
-                  from: { type: string, format: date-time }
-                  to: { type: string, format: date-time }
-                  points: { type: array, items: { type: object, additionalProperties: true } }
-                  totals: { type: object, additionalProperties: true }
+              schema: { $ref: "#/components/schemas/AppMetrics" }
         "400": { $ref: "#/components/responses/Invalid" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
@@ -1232,7 +1231,7 @@ paths:
         The last lines of what the app printed (`console.log`, `console.error`, uncaught errors) and of the host's own lines about it
         (a request line per request, a worker that stopped), oldest first, as plain text lines. The control plane stores none of it: the
         lines come from the app's host, which keeps up to about 16 MiB or 7 days of output per app (`retention` in the answer).
-        Lines have **no timestamp and no level** here (the host does not record them); the live stream has times.
+        Lines have **no level** here (the host does not record one) and no time in their text; `times` has the time each line was stored, in the same order (the live stream has times too).
 
         What is removed before a line is returned: the query string of every request URL in the host's request lines, and every value
         of the app's secrets of 8 characters or more (also URL-encoded, JSON-escaped, base64 and hex), replaced by `[redacted]`.
@@ -1255,6 +1254,7 @@ paths:
                 properties:
                   project: { type: string }
                   lines: { type: array, items: { type: string } }
+                  times: { type: array, items: { type: [integer, "null"] }, description: "The time the host stored each line of `lines`, ms since the epoch, in the same order; null for a line an older host stored (it has no stamp). Absent from a control plane before logs step 2." }
                   retention: { type: string, description: "How long the host keeps the app's output, in words." }
         "400": { $ref: "#/components/responses/Invalid" }
         "401": { $ref: "#/components/responses/Unauthorized" }
@@ -1276,7 +1276,7 @@ paths:
         - `ready`, once, first.
         - `event`, with an `event` object shaped like a `wrangler tail` event: `scriptName`, `outcome` (`ok`, `exception`, `exceededCpu`,
           `exceededWallTime`, `canceled`, `rateLimited`, ...), `eventTimestamp` (ms), `event` (`{request: {url, method}, response: {status}}`
-          for a request, `null` otherwise), `cpuTime` (always `null`), `wallTime` (ms), `logs` (`[{level, message: [string], timestamp}]`) and
+          for a request, `null` otherwise), `handler` (`fetch`, `scheduled` or `trigger`: which handler ran; an addition to the Wrangler shape), `cpuTime` (always `null`), `wallTime` (ms), `logs` (`[{level, message: [string], timestamp}]`) and
           `exceptions` (`[{name, message, timestamp, stack?}]`). A request, a console line and an error are **separate events**: the host
           cannot tell which request printed a line, so lines are not grouped under their request, and their `level` is always `log`.
           `url` is the full request URL **without its query string**.
@@ -1341,6 +1341,188 @@ paths:
         "429": { $ref: "#/components/responses/LimitedTail" }
         "502": { $ref: "#/components/responses/BadGateway" }
         "503": { $ref: "#/components/responses/UnavailableLogs" }
+  /v1/apps/{project}/invocations:
+    parameters:
+      - $ref: "#/components/parameters/project"
+    get:
+      operationId: listAppInvocations
+      tags: [Observability]
+      summary: "Recent runs of a running app, one per request"
+      description: |
+        What the Logs tab shows: the app's last stored output grouped into **invocations**, newest first. One invocation is one run of a handler:
+        a request (`handler: fetch`), a cron run (`scheduled`), a queue or alarm delivery or other background wake-up (`trigger`), or output no run claimed
+        (`system`: a line printed with no request after it, a worker that stopped). The Logs tab shows `scheduled` runs by default and hides `trigger` ones.
+        The control plane stores none of it: the lines come from the app's host (`retention` in the answer).
+
+        Field names follow OpenTelemetry's semantic conventions where they map: `attributes` carry `http.request.method`, `url.path`, `url.scheme`,
+        `server.address`, `http.response.status_code` and `faas.trigger` (`http`, `timer` or `other`; a cron run has no HTTP attributes), each exception
+        `exception.type`, `exception.message` and `exception.stacktrace`, each console line `severity_number` and `severity_text`. `trace_id`, `span_id`
+        and `faas.invocation_id` will appear when the runtime tags lines with a request id; they are absent today.
+
+        **Console lines are matched to a request by order** (`logs_matched_by: order`): the host records no request id on a line, so the lines seen since the
+        previous run are attached to the next one. When requests overlap, a line can land under the wrong one.
+
+        A host from logs step 2 on stamps every stored line with the time it read it and reports each request's **CPU time** (`cpu_ms`) and a cron run's
+        expression (`attributes["faas.cron"]`). A host before that records none: `time` is `null`, `cpu_ms` is `null` and a cron run has no `faas.cron`, and the
+        answer is otherwise the same. The host still records no **level** (`severity_number` is 0 on a console line; a stack trace has frames only if the
+        runtime printed them).
+
+        **Time range.** `from` and `to` keep the runs that finished in that range (epoch milliseconds or an ISO 8601 date-time with a zone; `to` is optional).
+        On a host with the time window the range is read from the host in full, newest first, up to 10,000 lines or about 10 MiB in all (`window.windowed` true; `window.truncated` says when the range holds more and older runs are left out). On a host from before it, the range is cut from the host's last `lines` stored lines (1000 at most), so a busy app's old runs may lie beyond it: `window.truncated` says so. A run with no
+        time (a line an older host stored) cannot be placed in a range and is left out of it (`window.untimed` counts them); on a host that records no times
+        (`window.times` false) a range therefore answers an empty list. `window` says what the answer covers.
+
+        Removed before an invocation is returned, exactly as in `GET /v1/apps/{project}/logs`: the query string, the `http://` scheme (shown `https://`),
+        and every secret value of 8 characters or more (also URL-encoded, JSON-escaped, base64 and hex), replaced by `[redacted]`. A message over 16 KiB is cut.
+      x-sproutboat-permission: "logs:read"
+      parameters:
+        - name: lines
+          in: query
+          description: "How many of the host's last stored lines to read, 1 to 1000. Default 500, or 1000 when `from` or `to` is set. An invocation takes one request line and the lines before it, so the answer has fewer invocations than lines."
+          schema: { type: integer, minimum: 1, maximum: 1000, default: 500 }
+        - name: status
+          in: query
+          description: "`ok` (the run was not an error), `error` (`status_code` is `ERROR`: an exception, a failed outcome, a 5xx, or a cron run that did not answer 2xx), a code such as `404` or a class such as `5xx` (requests only). Repeat the parameter or comma-separate."
+          schema: { type: array, items: { type: string } }
+          style: form
+          explode: true
+        - name: method
+          in: query
+          description: "HTTP methods (requests only), repeated or comma-separated."
+          schema: { type: array, items: { type: string } }
+          style: form
+          explode: true
+        - name: handler
+          in: query
+          description: "Only these kinds of run: `fetch`, `scheduled`, `trigger`, `system`. Repeat or comma-separate. Default: all."
+          schema: { type: array, items: { type: string, enum: [fetch, scheduled, trigger, system] } }
+          style: form
+          explode: true
+        - name: path
+          in: query
+          description: "A text the request path must contain (case-insensitive, at most 200 characters). Only requests have a path."
+          schema: { type: string, maxLength: 200 }
+        - name: search
+          in: query
+          description: "A text the method, path, a console line or an exception must contain (case-insensitive, at most 200 characters)."
+          schema: { type: string, maxLength: 200 }
+        - name: level
+          in: query
+          description: "Only runs with a line or exception of at least this level. `warn` is 13 and up, `error` 17 and up. An exception counts as an error; a console line has a level only where the host recorded one (none yet), so today this finds runs with an exception."
+          schema: { type: string, enum: [warn, error] }
+        - name: from
+          in: query
+          description: "Only runs that finished at or after this time: epoch milliseconds, or an ISO 8601 date-time with a zone (`2026-11-24T08:00:00Z`). Needs a host that stamps its lines (`window.times`)."
+          schema: { type: string, examples: ["1795532400000", "2026-11-24T08:00:00Z"] }
+        - name: to
+          in: query
+          description: "Only runs that finished at or before this time, in the same forms as `from`; must be after `from`. Default: now."
+          schema: { type: string, examples: ["1795536000000", "2026-11-24T09:00:00Z"] }
+      responses:
+        "200":
+          description: "The invocations, newest first."
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [project, invocations, retention, logs_matched_by, window, total]
+                properties:
+                  project: { type: string }
+                  invocations: { type: array, items: { $ref: "#/components/schemas/Invocation" } }
+                  retention: { type: string, description: "How long the host keeps the app's output, in words." }
+                  logs_matched_by: { type: string, enum: [order] }
+                  window:
+                    type: object
+                    required: [source, lines, read, from, to, windowed, times, oldest, newest, truncated, untimed]
+                    properties:
+                      source: { type: string, enum: [lines, time], description: "What bounds the answer: the last `lines` stored lines, or a time range cut from them." }
+                      lines: { type: integer, description: "The `lines` asked." }
+                      read: { type: integer, description: "Lines the host returned." }
+                      from: { type: [integer, "null"], description: "The range's start as asked, ms since the epoch; null without a range." }
+                      to: { type: [integer, "null"], description: "The range's end as asked; null without one (or with only `from`)." }
+                      times: { type: boolean, description: "Whether the host stamps its stored lines. False for a host from before logs step 2: no range can be answered there." }
+                      oldest: { type: [integer, "null"], description: "The oldest time stamped on a line read, ms since the epoch; null when none has one." }
+                      newest: { type: [integer, "null"], description: "The newest time stamped on a line read." }
+                      windowed: { type: boolean, description: "True when the host cut the range itself, so it was read in full up to the page cap. False for a host from before the time window: the range was cut from its last `lines` lines." }
+                      truncated: { type: boolean, description: "True when older runs of the range exist that this answer does not reach: with `windowed`, the page cap (10 pages of the host) was hit; otherwise the range starts before `oldest` and the read hit `lines`." }
+                      untimed: { type: integer, description: "Runs read that have no time (lines an older host stored). A range leaves them out." }
+                  total: { type: integer, description: "Invocations in the window (inside the range, when there is one) before the other filters." }
+        "400": { $ref: "#/components/responses/InvalidInvocations" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/LimitedData" }
+        "502": { $ref: "#/components/responses/BadGateway" }
+        "503": { $ref: "#/components/responses/UnavailableLogs" }
+  /v1/apps/{project}/invocations/tail:
+    parameters:
+      - $ref: "#/components/parameters/project"
+    get:
+      operationId: tailAppInvocations
+      tags: [Observability]
+      summary: "Stream a running app's runs live, one per request"
+      description: |
+        `text/event-stream`, the live counterpart of `GET /v1/apps/{project}/invocations`. Each `data:` line is one JSON object with a `type`:
+
+        - `ready`, once, first.
+        - `invocation`, with an `invocation` object (the same shape as in the list) when a run finishes. It carries the console lines and the error that came with
+          it, matched by order. `time` is the host's time when it finished. Lines no run claims within about 2 seconds arrive on their own as a `system`
+          invocation. A request that runs longer than that can therefore show its early lines apart from it.
+        - `dropped`, `closed` and the `: keepalive` comment: as in `GET /v1/apps/{project}/tail`. The viewer limits, the 10 minute session and the rate
+          cap (100 invocations a second after the filters) are the same, and share the same slots.
+
+        `GET /v1/apps/{project}/tail` is unchanged: the Wrangler-shaped events `sproutboat tail` reads. Query strings and secret values are removed as in the list.
+      x-sproutboat-permission: "logs:read"
+      parameters:
+        - name: status
+          in: query
+          description: "`ok` (the run was not an error), `error` (`status_code` is `ERROR`: an exception, a failed outcome, a 5xx, or a cron run that did not answer 2xx), a code such as `404` or a class such as `5xx` (requests only). Repeat the parameter or comma-separate."
+          schema: { type: array, items: { type: string } }
+          style: form
+          explode: true
+        - name: method
+          in: query
+          description: "HTTP methods (requests only), repeated or comma-separated."
+          schema: { type: array, items: { type: string } }
+          style: form
+          explode: true
+        - name: handler
+          in: query
+          description: "Only these kinds of run: `fetch`, `scheduled`, `trigger`, `system`. Repeat or comma-separate. Default: all."
+          schema: { type: array, items: { type: string, enum: [fetch, scheduled, trigger, system] } }
+          style: form
+          explode: true
+        - name: path
+          in: query
+          description: "A text the request path must contain (case-insensitive, at most 200 characters). Only requests have a path."
+          schema: { type: string, maxLength: 200 }
+        - name: search
+          in: query
+          description: "A text the method, path, a console line or an exception must contain (case-insensitive, at most 200 characters)."
+          schema: { type: string, maxLength: 200 }
+        - name: level
+          in: query
+          description: "Only runs with a line or exception of at least this level. `warn` is 13 and up, `error` 17 and up. An exception counts as an error; a console line has a level only where the host recorded one (none yet), so today this finds runs with an exception."
+          schema: { type: string, enum: [warn, error] }
+      responses:
+        "200":
+          description: "The event stream."
+          content:
+            text/event-stream:
+              schema:
+                type: string
+                examples:
+                  - |
+                    data: {"type":"ready"}
+
+                    data: {"type":"invocation","invocation":{"id":"i0","handler":"fetch","time":1795452909449,"outcome":"ok","status_code":"UNSET","duration_ms":12.3,"cpu_ms":null,"attributes":{"http.request.method":"GET","url.scheme":"https","server.address":"blog.acme.sproutboat.app","url.path":"/log","http.response.status_code":200,"faas.trigger":"http"},"exceptions":[],"logs":[{"time":1795452909448,"severity_number":0,"body":"hello from the log route","source":"app"}],"logs_matched_by":"order","logs_dropped":0}}
+        "400": { $ref: "#/components/responses/Invalid" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/LimitedTail" }
+        "502": { $ref: "#/components/responses/BadGateway" }
+        "503": { $ref: "#/components/responses/UnavailableLogs" }
   /v1/notices:
     get:
       operationId: listNotices
@@ -1381,7 +1563,7 @@ paths:
       operationId: getLimits
       tags: [Meta]
       summary: "Get the team's limits and usage"
-      description: "The free alpha limits that apply to the team (defaults, with any limit raised for this team) and what it uses now. `null` is unlimited. Memory, CPU, wall time, request rate and operations are ceilings on what an app may ask for in `limits`, so they have no usage."
+      description: "The free alpha limits that apply to the team (defaults, with any limit raised for this team) and what it uses now. `null` is unlimited. Builds and uploads are counted over a rolling 24 hours: nothing resets at midnight. Memory, CPU, wall time, request rate and operations are ceilings on what an app may ask for in `limits`, so they have no usage."
       x-sproutboat-permission: "app:read"
       responses:
         "200":
@@ -1390,7 +1572,7 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [enabled, limits, overridden, usage]
+                required: [enabled, limits, overridden, usage, contact, new_app_refusal]
                 properties:
                   enabled: { type: boolean, description: "False when this Cloud enforces no quotas." }
                   limits:
@@ -1410,11 +1592,19 @@ paths:
                     type: array
                     description: "The limits raised (or lowered) for this team."
                     items: { type: string, enum: [apps, memory_mb, builds_per_day, storage_mb, cpu_ms, wall_ms, rate_rps, ops_per_sec, source_mb_per_day, asset_mb_per_day] }
+                  contact: { type: string, description: "Where to ask for more room: an email address or a URL (by default `support@sproutboat.com`). It is the address the quota messages name." }
+                  new_app_refusal:
+                    type: [object, "null"]
+                    description: "What creating one more app would answer right now (403 `quota-apps`, with the same message), or null when there is room. A client can stop before it uploads or builds anything. Advisory: the write decides."
+                    properties:
+                      reason: { type: string, enum: [quota-apps] }
+                      message: { type: string }
                   usage:
                     type: object
                     properties:
                       apps: { type: integer }
-                      builds_24h: { type: integer }
+                      builds_24h: { type: integer, description: "Builds that compiled in the last 24 hours (against `limits.builds_per_day`); cache hits and prebuilds are free." }
+                      builds_next_slot_s: { type: [integer, "null"], description: "Seconds until the oldest counted build is 24 hours old and frees one build (never under 60; the `retry_after_s` of a 429 `quota-builds`). Null when no build counts. Room comes back one build at a time, not at a fixed hour." }
                       assets_mb: { type: number, description: "MiB of static assets across the team's apps." }
                       sources_mb_24h: { type: number, description: "MiB of new sources the team uploaded in the last 24 hours (against `limits.source_mb_per_day`)." }
                       assets_mb_24h: { type: number, description: "MiB of new asset blobs the team uploaded in the last 24 hours (against `limits.asset_mb_per_day`)." }
@@ -1468,7 +1658,7 @@ components:
         application/json:
           schema: { $ref: "#/components/schemas/ErrorPlain" }
     KeyRateLimited:
-      description: "The key is over 600 requests a minute (`reason: key-rate-limited`, `retry_after_s`, `Retry-After`)."
+      description: "The key is over its requests a minute (600, or 2,000 with `app:write`; `reason: key-rate-limited`, `retry_after_s`, `Retry-After`). Wait that long and retry."
       headers:
         Retry-After: { $ref: "#/components/headers/RetryAfter" }
       content:
@@ -1535,6 +1725,14 @@ components:
               - $ref: "#/components/schemas/ErrorQuotaOps"
     Invalid:
       description: "The request is malformed. `path` names the field when one is at fault; some refusals (a digest mismatch, a body that is not JSON) carry a message only."
+      content:
+        application/json:
+          schema:
+            oneOf:
+              - $ref: "#/components/schemas/ErrorInvalid"
+              - $ref: "#/components/schemas/ErrorPlain"
+    InvalidInvocations:
+      description: "A parameter is malformed or out of range (`invalid`, with its `path`): a bad `status`, `level`, `lines`, `from` or `to`, or a `to` that is not after `from`."
       content:
         application/json:
           schema:
@@ -1877,6 +2075,49 @@ components:
         application/json:
           schema: { $ref: "#/components/schemas/ErrorQuotaExceeded" }
   schemas:
+    Invocation:
+      description: "One run of a handler with what it printed. Names follow OpenTelemetry's semantic conventions where they map."
+      type: object
+      required: [id, handler, time, outcome, status_code, duration_ms, cpu_ms, attributes, exceptions, logs, logs_matched_by, logs_dropped]
+      properties:
+        id: { type: string, description: "Unique within one answer or stream, not across them." }
+        handler:
+          type: string
+          enum: [fetch, scheduled, trigger, system]
+          description: "`fetch`: a request. `scheduled`: a cron run. `trigger`: a queue or alarm delivery or other background wake-up. `system`: output no run claimed."
+        time: { type: [integer, "null"], description: "When it finished, ms since the epoch. Null on a line an older host stored (it has no stamp)." }
+        outcome: { type: string, description: "The host's outcome: `ok`, `exception`, `exceededCpu`, `exceededWallTime`, `canceled`, ..." }
+        status_code: { type: string, enum: [UNSET, ERROR], description: "OpenTelemetry span status: `ERROR` for an exception, a failed outcome, a 5xx, or a cron or background run the app did not answer with 2xx." }
+        duration_ms: { type: [number, "null"], description: "From arrival to reply, so queue wait included. Null for `system`." }
+        cpu_ms: { type: [number, "null"], description: "The CPU time the runtime measured for the request, in ms. Null when the host reports none: a host from before logs step 2, a streamed or non-string body, a compatibility date before 2026-11-02." }
+        attributes:
+          type: object
+          description: "OpenTelemetry attributes. A request has `http.request.method`, `url.path` (no query), `url.scheme` (`https`), `server.address`, `http.response.status_code` and `faas.trigger: http`; a cron run `faas.trigger: timer` and, when the host reports it, `faas.cron` (the expression, such as `*/5 * * * *`); a background run `faas.trigger: other`; `system` has none. `trace_id`, `span_id` and `faas.invocation_id` will join them."
+          additionalProperties: { type: [string, integer] }
+        exceptions:
+          type: array
+          items:
+            type: object
+            required: [time, exception.type, exception.message]
+            properties:
+              time: { type: [integer, "null"] }
+              exception.type: { type: string, description: "The error's name, or `WorkerStopped` when the host stopped the worker (the message says why)." }
+              exception.message: { type: string }
+              exception.stacktrace: { type: string, description: "Present only when frames follow the first line; the runtime prints none for most errors today." }
+        logs:
+          type: array
+          description: "What the app printed, oldest first, matched to this run by order."
+          items:
+            type: object
+            required: [time, severity_number, body, source]
+            properties:
+              time: { type: [integer, "null"] }
+              severity_number: { type: integer, description: "OpenTelemetry severity: 0 unspecified (the host records no level yet), 13 warn, 17 error." }
+              severity_text: { type: string }
+              body: { type: string }
+              source: { type: string, enum: [app, host], description: "`host` for a line sproutd wrote about the app, `app` for what the app printed." }
+        logs_matched_by: { type: string, enum: [order], description: "How lines were attached: by order, because the host records no request id on a line." }
+        logs_dropped: { type: integer, description: "Lines that did not fit (at most 200 or 64 KiB wait for a run) and were dropped, oldest first." }
     Error:
       type: object
       required: [error]
@@ -2130,7 +2371,7 @@ components:
         error: { type: string, description: "A message for people. Do not parse it." }
         reason: { type: string, const: memory-limit, enum: [memory-limit] }
     ErrorKeyRateLimited:
-      description: "The key is over 600 requests a minute."
+      description: "The key is over its requests a minute (600, or 2,000 with `app:write`)."
       type: object
       required: [error, reason, retry_after_s]
       properties:
@@ -2340,19 +2581,127 @@ components:
       properties:
         app_id: { type: string }
         record_generation: { type: integer, description: "Wait for `apply.applied_generation` of the app to reach this." }
+    AppMetrics:
+      type: object
+      required: [range, step_seconds, from, to, retention, duration_bounds_ms, outcome_names, memory_limit_bytes, points, totals]
+      properties:
+        range: { type: string, enum: ["1h", "24h", "7d", "30d", "90d"], description: "The range asked for." }
+        step_seconds: { type: integer, description: "The width of one point: 60 for 1h, 600 for 24h, 3600 for 7d and 30d, 86400 for 90d." }
+        from: { type: string, format: date-time }
+        to: { type: string, format: date-time }
+        retention:
+          type: object
+          required: [minute_days, hourly_days, note]
+          properties:
+            minute_days: { type: integer, description: "How long one-minute points are kept (7)." }
+            hourly_days: { type: integer, description: "How long hourly points are kept (90)." }
+            note: { type: string }
+        duration_bounds_ms:
+          type: array
+          items: { type: number }
+          description: "Upper bounds, in milliseconds, of the buckets of every histogram here (`dur`, `wake_dur`, `request_cpu.hist`): 0.5, 1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000. Each histogram has one more entry than this list, for everything above the last bound."
+        outcome_names:
+          type: array
+          items: { type: string }
+          description: "The names, in order, of the entries of `outcomes`: ok, exception, exceededCpu, exceededWallTime, canceled, rateLimited, suspended, unavailable, queueFull."
+        memory_limit_bytes: { type: [integer, "null"], description: "The app's memory limit, or null while neither a host reading nor a limit in the spec is known." }
+        points:
+          type: array
+          description: "Oldest first; a step with no data has no point."
+          items: { $ref: "#/components/schemas/MetricsPoint" }
+        totals: { $ref: "#/components/schemas/MetricsTotals" }
+    MetricsHistogram:
+      type: array
+      description: "Counts per bucket of `duration_bounds_ms`, with a last entry for everything above the last bound (15 entries)."
+      items: { type: integer, minimum: 0 }
+    MetricsCounts:
+      type: object
+      required: [requests, status, outcomes, dur, trig, wakes, sleeps, cpu_us, oom_kills, crashes]
+      properties:
+        requests: { type: integer, description: "Requests answered." }
+        status:
+          type: array
+          items: { type: integer }
+          description: "Six counts in this order: no status, 1xx, 2xx, 3xx, 4xx, 5xx."
+        outcomes:
+          type: array
+          items: { type: integer }
+          description: "Nine counts in the order of `outcome_names`."
+        dur: { $ref: "#/components/schemas/MetricsHistogram" }
+        p50_ms: { type: [number, "null"], description: "Response time quantiles from `dur`, linear inside the bucket; null with no requests. The overflow bucket answers its lower bound (10000)." }
+        p95_ms: { type: [number, "null"] }
+        p99_ms: { type: [number, "null"] }
+        trig:
+          type: array
+          items: { type: integer }
+          description: "Four counts in this order: scheduled ok, scheduled failed, other ok, other failed."
+        wakes: { type: integer, description: "Times the app was started for a request or trigger." }
+        sleeps: { type: integer, description: "Times it was put to sleep." }
+        cpu_us: { type: integer, description: "CPU time of the worker process, microseconds." }
+        oom_kills: { type: integer }
+        crashes: { type: integer }
+        request_cpu: { $ref: "#/components/schemas/RequestCpu" }
+    MetricsPoint:
+      description: "One step of the series."
+      allOf:
+        - $ref: "#/components/schemas/MetricsCounts"
+        - type: object
+          required: [t, dur_us, wake_dur, wake_us, mem_peak, mem_cur]
+          properties:
+            t: { type: string, format: date-time, description: "The start of the step." }
+            dur_us: { type: integer, description: "The summed response time, microseconds; with `requests` it gives the mean." }
+            wake_dur: { $ref: "#/components/schemas/MetricsHistogram" }
+            wake_us: { type: integer, description: "The summed wake time, microseconds." }
+            mem_peak: { type: [integer, "null"], description: "The largest memory peak seen in the step, bytes." }
+            mem_cur: { type: [integer, "null"], description: "The last memory reading in the step, bytes." }
+    MetricsTotals:
+      description: "The sum over the range."
+      allOf:
+        - $ref: "#/components/schemas/MetricsCounts"
+        - type: object
+          required: [errors_5xx, mem_peak]
+          properties:
+            errors_5xx: { type: integer, description: "`status[5]`." }
+            mem_peak: { type: [integer, "null"], description: "The largest memory peak in the range, bytes." }
+    RequestCpu:
+      description: |
+        The CPU time of each request the runtime stamped one on, in the buckets of `duration_bounds_ms`. **Absent** (the key is not there, not zero or null) where no request
+        reported a CPU time: a host from before logs step 2, or a quiet minute. Read it as optional; an app on an old host has none.
+      type: object
+      required: [hist, p50_ms, p95_ms, p99_ms, sum_ms]
+      properties:
+        hist: { $ref: "#/components/schemas/MetricsHistogram" }
+        p50_ms: { type: [number, "null"], description: "CPU time per request at the median, milliseconds, from `hist`." }
+        p95_ms: { type: [number, "null"] }
+        p99_ms: { type: [number, "null"] }
+        sum_ms: { type: number, description: "Total CPU time of those requests, milliseconds; a mean is `sum_ms` over the sum of `hist`." }
     SecretWritten:
       type: object
-      required: [app_id, record_generation, name]
+      required: [app_id, record_generation, name, warnings]
       properties:
         app_id: { type: string }
         record_generation: { type: integer }
         name: { type: string }
+        warnings: { $ref: "#/components/schemas/SecretWarnings" }
+    SecretWarnings:
+      type: array
+      description: "Empty when every name set is declared. Absent from answers of Clouds before 2026-11-25."
+      items: { $ref: "#/components/schemas/SecretWarning" }
+    SecretWarning:
+      type: object
+      required: [code, name, message, fix]
+      properties:
+        code: { type: string, const: secret-not-declared, enum: [secret-not-declared], description: "Match on this, not on the text." }
+        name: { type: string, description: "The secret that is stored but not declared." }
+        message: { type: string, description: "A message for people. Do not parse it." }
+        fix: { type: string, description: "The change that makes the Worker see it, as one line for people: add the name to `secrets` in sproutboat.jsonc and deploy." }
     SecretsPatch:
       type: object
       additionalProperties: false
       properties:
         set:
           type: object
+          x-sensitive: true
           description: "Secret name to value. The values are secrets: never returned by any route, keep them out of logs."
           additionalProperties: { type: string, format: password, writeOnly: true, x-sensitive: true }
         delete:
@@ -2477,6 +2826,7 @@ components:
               description: "Absent keeps the stored secrets, null clears them, an object replaces the set. Needs `secret:write`."
               oneOf:
                 - type: object
+                  x-sensitive: true
                   description: "Secret name to value. The values are secrets: never returned by any route, keep them out of logs."
                   additionalProperties: { type: string, format: password, writeOnly: true, x-sensitive: true }
                 - type: "null"
@@ -2569,7 +2919,7 @@ components:
         kind: { type: string, enum: [platform, custom] }
         cert:
           type: [object, "null"]
-          description: "Certificate state of the name, or null when not checked."
+          description: "Certificate state of the name, or null when not checked. For a `platform` name it is the team wildcard's state: `pending` from team creation until the issuer has installed it (usually about 3 minutes: up to one 2-minute timer tick plus about a minute to issue; retried with a backoff on `failed`), and a name under it does not answer over HTTPS until `ready`. A client that prints a deploy's URL should wait for it (the CLI does)."
           properties:
             state: { type: string, enum: [pending, ready, failed, checking] }
             error: { type: [string, "null"] }
