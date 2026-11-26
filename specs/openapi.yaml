@@ -1631,8 +1631,8 @@ components:
       name: project
       in: path
       required: true
-      description: "The app's name, unique within the team. 3 to 32 characters (or 1), lowercase letters, digits and dashes, not starting or ending with a dash."
-      schema: { type: string, pattern: "^[a-z0-9](?:[a-z0-9-]{1,30}[a-z0-9])?$", examples: [my-app] }
+      description: "The app's name, unique within the team. 3 to 51 characters (or 1), lowercase letters, digits and dashes, not starting or ending with a dash."
+      schema: { type: string, pattern: "^[a-z0-9](?:[a-z0-9-]{1,49}[a-z0-9])?$", examples: [my-app] }
     sha256:
       name: sha256
       in: path
